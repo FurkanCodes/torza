@@ -35,3 +35,12 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race ./...
+
+  docker:
+    # Builds the server image so a broken Dockerfile shows up on every push,
+    # not at deploy time. Nothing is pushed anywhere.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t torza:ci .
