@@ -88,6 +88,13 @@ http://localhost:8081, both reachable from this Mac only. Open a link in
 VLC, IINA or QuickTime to stream it. Downloads use your home connection, so
 test with legal torrents such as Linux ISOs or Creative Commons films.
 
+To use it from a phone or TV on the same Wi-Fi, run `deploy/local.sh lan on`.
+It prints the address to open (for example http://192.168.1.166:8080), and
+new download links point at that address too. The API still needs a key and
+every link is still signed; qBittorrent's Web UI stays on this Mac only. Run
+it again when the Mac's address changes, and `deploy/local.sh lan off` to
+close it. Links made before switching keep the old address: make new ones.
+
 ## Deploying (first time)
 
 These steps haven't been run yet. Check each one on the first deploy.

@@ -1,12 +1,13 @@
 # Local run on a Mac: no Caddy and no domain. The API and the stream service
-# are published on localhost only. Use ./local.sh rather than calling this
-# file directly.
+# are published on localhost only, or on the home network after
+# `./local.sh lan on` (BIND_ADDR=0.0.0.0). Use ./local.sh rather than calling
+# this file directly.
 services:
   caddy:
     profiles: ["server"] # not started locally
   api:
     ports:
-      - "127.0.0.1:8080:8080"
+      - "${BIND_ADDR:-127.0.0.1}:8080:8080"
   stream:
     ports:
-      - "127.0.0.1:8081:8081"
+      - "${BIND_ADDR:-127.0.0.1}:8081:8081"

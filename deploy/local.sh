@@ -5,6 +5,7 @@
 #   deploy/local.sh logs [service]
 #   deploy/local.sh ps
 #   deploy/local.sh user EMAIL [-admin]   create a user and print its API key
+#   deploy/local.sh lan on|off   open Torza to other devices on your Wi-Fi, or close it
 set -eu
 cd "$(dirname "$0")"
 
@@ -40,8 +41,30 @@ user)
 	shift
 	dc run --rm api api create-user -email "$email" "$@"
 	;;
+lan)
+	case "${1:-}" in
+	on)
+		ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+		[ -n "$ip" ] || { echo "no Wi-Fi or Ethernet address found" >&2; exit 1; }
+		bind=0.0.0.0
+		url=http://$ip:8081
+		;;
+	off)
+		ip=localhost
+		bind=127.0.0.1
+		url=http://localhost:8081
+		;;
+	*) echo "usage: $0 lan on|off" >&2; exit 2 ;;
+	esac
+	# Older .env.local files have no BIND_ADDR line yet.
+	grep -q '^BIND_ADDR=' .env.local || echo "BIND_ADDR=127.0.0.1" >>.env.local
+	sed -i '' -e "s#^PUBLIC_URL=.*#PUBLIC_URL=$url#" -e "s#^BIND_ADDR=.*#BIND_ADDR=$bind#" .env.local
+	dc up -d --no-build api stream
+	echo "web page: http://$ip:8080   stream links: $url"
+	[ "$1" = on ] && echo "If macOS asks whether Docker may accept incoming connections, allow it. Rerun this when the Mac's address changes."
+	;;
 *)
-	sed -n '2,8p' "$0"
+	sed -n '2,9p' "$0"
 	exit 2
 	;;
 esac
