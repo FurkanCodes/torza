@@ -5,3 +5,4 @@ deploy/.env.local
 deploy/data-local/
 deploy/.local-api-key
 deploy/.local-last-link
+deploy/.local-api-key-*
