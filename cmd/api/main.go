@@ -1,6 +1,7 @@
 // Command api runs Torza's public REST API.
 //
 //	api                                   start the server
+//	api migrate                           run database migrations and exit
 //	api create-user -email you@x [-admin] create a user and print their API key
 package main
 
@@ -15,9 +16,9 @@ import (
 	"torza/internal/auth"
 	"torza/internal/config"
 	"torza/internal/db"
-	"torza/internal/jobs"
 	"torza/internal/links"
 	"torza/internal/run"
+	"torza/internal/service"
 )
 
 func main() {
@@ -39,6 +40,10 @@ func main() {
 	}
 	repo := db.NewRepo(pool)
 
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		fmt.Println("migrations are up to date")
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "create-user" {
 		if err := createUser(ctx, repo, os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "create-user:", err)
@@ -50,17 +55,12 @@ func main() {
 	if err := cfg.RequireSigningKey(); err != nil {
 		run.Fatal(log, "config", err)
 	}
-	nc, err := jobs.Connect(cfg.NATSURL, log)
-	if err != nil {
-		run.Fatal(log, "nats", err)
-	}
-	defer nc.Close()
-
-	srv := api.New(repo, jobs.NewNotifier(nc), links.NewSigner(cfg.SigningKey), api.Config{
-		PublicURL:        cfg.PublicURL,
-		LinkTTL:          cfg.LinkTTL,
-		MaxActivePerUser: cfg.MaxActivePerUser,
-	}, log)
+	svc := service.New(repo, links.NewSigner(cfg.SigningKey), service.Config{
+		PublicURL: cfg.PublicURL,
+		LinkTTL:   cfg.LinkTTL,
+		Defaults:  db.Limits{MaxActive: cfg.MaxActivePerUser, MaxItemBytes: cfg.MaxTorrentBytes},
+	})
+	srv := api.New(svc, api.Config{PublicURL: cfg.PublicURL}, log)
 	if err := run.ServeHTTP(ctx, log, cfg.APIAddr, srv.Handler()); err != nil {
 		run.Fatal(log, "http", err)
 	}

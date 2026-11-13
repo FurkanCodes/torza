@@ -1,14 +1,19 @@
-// Command ingest hands queued torrents to qBittorrent and moves finished ones
-// into the cache.
+// Command ingest fills the cache: it runs one loop per fetcher (qBittorrent
+// today), claiming queued items and moving finished downloads into the cache.
 package main
 
 import (
+	"fmt"
+	"strings"
+	"sync"
+
 	"torza/internal/config"
 	"torza/internal/db"
 	"torza/internal/ingest"
-	"torza/internal/jobs"
 	"torza/internal/qbit"
 	"torza/internal/run"
+	"torza/internal/source"
+	"torza/internal/source/qbitsource"
 	"torza/internal/store"
 )
 
@@ -33,24 +38,31 @@ func main() {
 	if err := db.Migrate(ctx, pool); err != nil {
 		run.Fatal(log, "migrate", err)
 	}
-	qb, err := qbit.New(cfg.QbitURL, cfg.QbitUser, cfg.QbitPass)
-	if err != nil {
-		run.Fatal(log, "qbittorrent", err)
-	}
-	nc, err := jobs.Connect(cfg.NATSURL, log)
-	if err != nil {
-		run.Fatal(log, "nats", err)
-	}
-	defer nc.Close()
-	wake, err := jobs.Wake(nc, jobs.IngestQueue, jobs.SubjectQueued, jobs.SubjectBlocked)
-	if err != nil {
-		run.Fatal(log, "nats subscribe", err)
+	repo := db.NewRepo(pool)
+
+	var sources []source.Source
+	for _, name := range cfg.Fetchers {
+		switch strings.TrimSpace(name) {
+		case "qbittorrent":
+			qb, err := qbit.New(cfg.QbitURL, cfg.QbitUser, cfg.QbitPass)
+			if err != nil {
+				run.Fatal(log, "qbittorrent", err)
+			}
+			sources = append(sources, qbitsource.New(qb, cfg.DataDir))
+		default:
+			run.Fatal(log, "config", fmt.Errorf("INGEST_FETCHERS: unknown fetcher %q", name))
+		}
 	}
 
-	w := ingest.New(db.NewRepo(pool), qb, st, ingest.Config{
-		MaxTorrentBytes: cfg.MaxTorrentBytes,
-		MetadataTimeout: cfg.MetadataTimeout,
-	}, log)
-	log.Info("ingest running", "poll_interval", cfg.PollInterval.String())
-	w.Run(ctx, cfg.PollInterval, wake)
+	var wg sync.WaitGroup
+	for _, src := range sources {
+		wake := db.Listen(ctx, pool, log, db.ChanQueued(src.Name()), db.ChanBlocked)
+		w := ingest.New(repo, src, st, ingest.Config{
+			MaxItemBytes: cfg.MaxTorrentBytes,
+			Policy:       ingest.Policy{MetadataTimeout: cfg.MetadataTimeout},
+		}, log)
+		log.Info("ingest running", "fetcher", src.Name(), "poll_interval", cfg.PollInterval.String())
+		wg.Go(func() { w.Run(ctx, cfg.PollInterval, wake) })
+	}
+	wg.Wait()
 }

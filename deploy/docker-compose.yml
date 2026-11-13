@@ -4,7 +4,6 @@ name: torza
 
 x-torza-env: &torza-env
   DATABASE_URL: postgres://torza:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/torza?sslmode=disable
-  NATS_URL: nats://nats:4222
   DATA_DIR: /data
   PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
   SIGNING_KEY: ${SIGNING_KEY:?set SIGNING_KEY in .env}
@@ -16,6 +15,8 @@ x-torza-env: &torza-env
   MAX_TORRENT_BYTES: ${MAX_TORRENT_BYTES:-100GB}
   CACHE_MAX_BYTES: ${CACHE_MAX_BYTES:-0}
   CACHE_MIN_FREE_BYTES: ${CACHE_MIN_FREE_BYTES:-20GB}
+  EVICT_IDLE_FOR: ${EVICT_IDLE_FOR:-6h}
+  INGEST_FETCHERS: ${INGEST_FETCHERS:-qbittorrent}
 
 x-torza: &torza
   image: torza:local
@@ -23,7 +24,7 @@ x-torza: &torza
     context: ..
   restart: unless-stopped
   environment: *torza-env
-  depends_on: [postgres, nats]
+  depends_on: [postgres]
 
 services:
   postgres:
@@ -35,10 +36,6 @@ services:
       POSTGRES_DB: torza
     volumes:
       - pgdata:/var/lib/postgresql/data
-
-  nats:
-    image: nats:2
-    restart: unless-stopped
 
   qbittorrent:
     # Pin to a specific version tag after the first successful deploy.
@@ -76,7 +73,7 @@ services:
   ingest:
     <<: *torza
     command: ["ingest"]
-    depends_on: [postgres, nats, qbittorrent]
+    depends_on: [postgres, qbittorrent]
     volumes:
       - ${DATA_PATH:-./data}:/data
 

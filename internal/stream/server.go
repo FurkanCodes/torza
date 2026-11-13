@@ -12,30 +12,37 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
-	"os"
 	"path"
 
 	"torza/internal/db"
 	"torza/internal/links"
+	"torza/internal/service"
 	"torza/internal/store"
 )
 
-// Repo is the part of the database the stream service needs.
-type Repo interface {
-	FileForUser(ctx context.Context, userID, fileID int64) (db.File, db.Torrent, error)
-	TouchTorrent(ctx context.Context, infohash string) error
+// UseAfter is how many bytes a response must send before the read counts as
+// use for eviction. Opening a file, HEAD requests and media scanners reading
+// headers don't keep content cached.
+const UseAfter = 8 << 20
+
+// Access is the part of the service layer the stream service needs.
+type Access interface {
+	Readable(ctx context.Context, userID, fileID int64) (db.File, db.Item, error)
+	Touch(ctx context.Context, itemID int64) error
 }
 
 type Server struct {
-	repo   Repo
+	access Access
 	signer *links.Signer
 	store  store.Store
 	log    *slog.Logger
 }
 
-func New(repo Repo, signer *links.Signer, st store.Store, log *slog.Logger) *Server {
-	return &Server{repo: repo, signer: signer, store: st, log: log}
+func New(access Access, signer *links.Signer, st store.Store, log *slog.Logger) *Server {
+	return &Server{access: access, signer: signer, store: st, log: log}
 }
+
+var _ Access = (*service.Service)(nil)
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -56,54 +63,71 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Re-check access: the user may have removed the torrent, or it may have
+	// Re-check access: the user may have removed the item, or it may have
 	// been evicted or blocked since the link was made.
-	file, t, err := s.repo.FileForUser(r.Context(), claims.UserID, claims.FileID)
-	if errors.Is(err, db.ErrNotFound) {
+	file, it, err := s.access.Readable(r.Context(), claims.UserID, claims.FileID)
+	switch {
+	case err == nil:
+	case errors.Is(err, db.ErrBlocked):
+		http.Error(w, "This file was removed after a takedown request.", http.StatusUnavailableForLegalReasons)
+		return
+	case errors.Is(err, db.ErrNotFound):
 		http.Error(w, "File not found.", http.StatusNotFound)
 		return
-	}
-	if err != nil {
-		s.log.Error("find file", "err", err)
+	case errors.Is(err, service.ErrNotReady), errors.Is(err, service.ErrGone):
+		http.Error(w, "This file is no longer cached. Get a new link; Torza downloads it again.", http.StatusNotFound)
+		return
+	default:
+		s.log.Error("check access", "err", err)
 		http.Error(w, "Internal error.", http.StatusInternalServerError)
 		return
 	}
-	switch t.Status {
-	case db.StatusReady:
-	case db.StatusBlocked:
-		http.Error(w, "This file was removed after a takedown request.", http.StatusUnavailableForLegalReasons)
-		return
-	default:
-		http.Error(w, "This file is no longer cached. Add the torrent again.", http.StatusNotFound)
-		return
-	}
 
-	p, err := s.store.FilePath(file.InfoHash, file.Path)
+	f, err := s.store.Open(it.ID, file.Path)
 	if err != nil {
-		http.Error(w, "File not found.", http.StatusNotFound)
-		return
-	}
-	f, err := os.Open(p)
-	if err != nil {
-		s.log.Warn("cached file missing", "infohash", file.InfoHash, "path", file.Path, "err", err)
+		s.log.Warn("cached file missing", "item", it.ID, "path", file.Path, "err", err)
 		http.Error(w, "File not found.", http.StatusNotFound)
 		return
 	}
 	defer f.Close()
 	info, err := f.Stat()
-	if err != nil || info.IsDir() {
+	if err != nil || !info.Mode().IsRegular() {
 		http.Error(w, "File not found.", http.StatusNotFound)
 		return
-	}
-
-	if err := s.repo.TouchTorrent(r.Context(), t.InfoHash); err != nil {
-		s.log.Warn("touch torrent", "infohash", t.InfoHash, "err", err)
 	}
 
 	name := path.Base(file.Path)
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": name}))
 	w.Header().Set("Cache-Control", "private, max-age=3600")
 	w.Header().Set("ETag", fmt.Sprintf(`"%d-%d-%d"`, file.ID, info.Size(), info.ModTime().Unix()))
+	// A small file read in full counts too.
+	cw := &countingWriter{ResponseWriter: w, after: max(1, min(UseAfter, info.Size())), onUse: func() {
+		if err := s.access.Touch(context.WithoutCancel(r.Context()), it.ID); err != nil {
+			s.log.Warn("record use", "item", it.ID, "err", err)
+		}
+	}}
 	// ServeContent handles Range, If-Range, HEAD and Content-Type for us.
-	http.ServeContent(w, r, name, info.ModTime(), f)
+	http.ServeContent(cw, r, name, info.ModTime(), f)
 }
+
+// countingWriter calls onUse once, when the response body passes after bytes.
+type countingWriter struct {
+	http.ResponseWriter
+	n     int64
+	after int64
+	onUse func()
+	used  bool
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.ResponseWriter.Write(p)
+	c.n += int64(n)
+	if !c.used && c.n >= c.after {
+		c.used = true
+		c.onUse()
+	}
+	return n, err
+}
+
+// Unwrap lets http.ResponseController reach the real writer.
+func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }

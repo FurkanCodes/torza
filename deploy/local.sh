@@ -30,7 +30,7 @@ up)
 	# Build the shared image once; four services building it at the same
 	# time collide on the tag.
 	dc build api
-	dc up -d --no-build
+	dc up -d --no-build --remove-orphans
 	;;
 down) dc down ;;
 logs) dc logs --tail=100 "$@" ;;

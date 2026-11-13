@@ -1,10 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,8 +16,9 @@ import (
 
 	"torza/internal/auth"
 	"torza/internal/db"
+	"torza/internal/dbtest"
 	"torza/internal/links"
-	"torza/internal/magnet"
+	"torza/internal/service"
 )
 
 const (
@@ -25,103 +29,31 @@ const (
 
 var signingKey = []byte("0123456789abcdef0123456789abcdef")
 
-type fakeRepo struct {
-	users map[string]db.User // keyed by string(key hash)
+func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-	addStatus string
-	addQueued bool
-	addErr    error
-	added     []string
-
-	library map[string]db.Torrent // the test user's library, by info hash
-	files   map[int64]db.File
-	blocked map[string]string
+// webServer serves the web page only; it has no database.
+func webServer() http.Handler {
+	return New(nil, Config{PublicURL: "http://localhost:8081"}, discard()).Handler()
 }
 
-func (f *fakeRepo) UserByKeyHash(_ context.Context, h []byte) (db.User, error) {
-	u, ok := f.users[string(h)]
-	if !ok {
-		return db.User{}, db.ErrNotFound
-	}
-	return u, nil
+type env struct {
+	h    http.Handler
+	repo *db.Repo
 }
 
-func (f *fakeRepo) AddTorrentForUser(_ context.Context, _ int64, m magnet.Magnet, _ int) (db.Torrent, bool, error) {
-	if f.addErr != nil {
-		return db.Torrent{}, false, f.addErr
+// newEnv is a full API on a real database with a user and an admin.
+func newEnv(t *testing.T, defaults db.Limits) *env {
+	t.Helper()
+	repo := dbtest.Repo(t)
+	ctx := context.Background()
+	if _, err := repo.CreateUser(ctx, "user@example.test", false, auth.HashKey(userKey), "u"); err != nil {
+		t.Fatal(err)
 	}
-	f.added = append(f.added, m.InfoHash)
-	return db.Torrent{InfoHash: m.InfoHash, Name: m.Name, Status: f.addStatus}, f.addQueued, nil
-}
-
-func (f *fakeRepo) ListUserTorrents(context.Context, int64) ([]db.Torrent, error) {
-	var out []db.Torrent
-	for _, t := range f.library {
-		out = append(out, t)
+	if _, err := repo.CreateUser(ctx, "admin@example.test", true, auth.HashKey(adminKey), "a"); err != nil {
+		t.Fatal(err)
 	}
-	return out, nil
-}
-
-func (f *fakeRepo) UserTorrent(_ context.Context, _ int64, ih string) (db.Torrent, []db.File, error) {
-	t, ok := f.library[ih]
-	if !ok {
-		return db.Torrent{}, nil, db.ErrNotFound
-	}
-	var files []db.File
-	for _, file := range f.files {
-		if file.InfoHash == ih {
-			files = append(files, file)
-		}
-	}
-	return t, files, nil
-}
-
-func (f *fakeRepo) RemoveUserTorrent(_ context.Context, _ int64, ih string) error {
-	if _, ok := f.library[ih]; !ok {
-		return db.ErrNotFound
-	}
-	delete(f.library, ih)
-	return nil
-}
-
-func (f *fakeRepo) FileForUser(_ context.Context, _ int64, id int64) (db.File, db.Torrent, error) {
-	file, ok := f.files[id]
-	if !ok {
-		return db.File{}, db.Torrent{}, db.ErrNotFound
-	}
-	t, ok := f.library[file.InfoHash]
-	if !ok {
-		return db.File{}, db.Torrent{}, db.ErrNotFound
-	}
-	return file, t, nil
-}
-
-func (f *fakeRepo) Block(_ context.Context, ih, reason, _ string) error {
-	f.blocked[ih] = reason
-	return nil
-}
-
-type fakeNotifier struct{ queued, blocked []string }
-
-func (n *fakeNotifier) TorrentQueued(ih string) error  { n.queued = append(n.queued, ih); return nil }
-func (n *fakeNotifier) TorrentBlocked(ih string) error { n.blocked = append(n.blocked, ih); return nil }
-
-func newTestServer() (http.Handler, *fakeRepo, *fakeNotifier) {
-	repo := &fakeRepo{
-		users: map[string]db.User{
-			string(auth.HashKey(userKey)):  {ID: 1, Email: "user@example.com"},
-			string(auth.HashKey(adminKey)): {ID: 2, Email: "admin@example.com", IsAdmin: true},
-		},
-		addStatus: db.StatusQueued,
-		addQueued: true,
-		library:   map[string]db.Torrent{},
-		files:     map[int64]db.File{},
-		blocked:   map[string]string{},
-	}
-	n := &fakeNotifier{}
-	cfg := Config{PublicURL: "https://torza.test", LinkTTL: time.Hour, MaxActivePerUser: 3}
-	s := New(repo, n, links.NewSigner(signingKey), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	return s.Handler(), repo, n
+	svc := service.New(repo, links.NewSigner(signingKey), service.Config{PublicURL: "http://dl.test", LinkTTL: time.Hour, Defaults: defaults})
+	return &env{h: New(svc, Config{PublicURL: "http://dl.test"}, discard()).Handler(), repo: repo}
 }
 
 func call(h http.Handler, method, target, key, body string) *httptest.ResponseRecorder {
@@ -134,147 +66,191 @@ func call(h http.Handler, method, target, key, body string) *httptest.ResponseRe
 	return rec
 }
 
-func TestAuth(t *testing.T) {
-	h, _, _ := newTestServer()
-	if rec := call(h, "GET", "/v1/me", "", ""); rec.Code != http.StatusUnauthorized {
-		t.Errorf("no key: %d", rec.Code)
+func decode(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var v map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
+		t.Fatalf("body %q: %v", rec.Body.String(), err)
 	}
-	if rec := call(h, "GET", "/v1/me", "torza_wrong", ""); rec.Code != http.StatusUnauthorized {
-		t.Errorf("wrong key: %d", rec.Code)
-	}
-	rec := call(h, "GET", "/v1/me", userKey, "")
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "user@example.com") {
-		t.Errorf("valid key: %d %s", rec.Code, rec.Body)
-	}
-	if rec := call(h, "GET", "/healthz", "", ""); rec.Code != http.StatusNoContent {
-		t.Errorf("healthz: %d", rec.Code)
-	}
+	return v
 }
 
-func TestAddTorrent(t *testing.T) {
-	h, repo, n := newTestServer()
-	body := `{"magnet": "magnet:?xt=urn:btih:` + hash + `&dn=Test"}`
-
-	rec := call(h, "POST", "/v1/torrents", userKey, body)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("add: %d %s", rec.Code, rec.Body)
+// finish plays ingest: every queued item becomes ready with the given files.
+func (e *env) finish(t *testing.T, files ...string) {
+	t.Helper()
+	ctx := context.Background()
+	jobs, err := e.repo.Claim(ctx, "qbittorrent", 100, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(repo.added) != 1 || repo.added[0] != hash {
-		t.Fatalf("repo got %v", repo.added)
-	}
-	if len(n.queued) != 1 || n.queued[0] != hash {
-		t.Fatalf("ingest wasn't woken: %v", n.queued)
-	}
-
-	// Already cached: no new download, so ingest isn't woken.
-	repo.addQueued, repo.addStatus = false, db.StatusReady
-	if rec := call(h, "POST", "/v1/torrents", userKey, body); rec.Code != http.StatusOK {
-		t.Fatalf("add cached: %d", rec.Code)
-	}
-	if len(n.queued) != 1 {
-		t.Fatalf("woke ingest for a cached torrent")
-	}
-
-	cases := []struct {
-		name string
-		err  error
-		body string
-		want int
-	}{
-		{"blocked", db.ErrBlocked, body, http.StatusUnavailableForLegalReasons},
-		{"too many", db.ErrTooManyActive, body, http.StatusTooManyRequests},
-		{"bad magnet", nil, `{"magnet": "nope"}`, http.StatusBadRequest},
-		{"not json", nil, `magnet please`, http.StatusBadRequest},
-	}
-	for _, c := range cases {
-		repo.addErr = c.err
-		if rec := call(h, "POST", "/v1/torrents", userKey, c.body); rec.Code != c.want {
-			t.Errorf("%s: got %d, want %d (%s)", c.name, rec.Code, c.want, rec.Body)
+	for _, j := range jobs {
+		var m []db.ManifestFile
+		for _, f := range files {
+			m = append(m, db.ManifestFile{Path: f, SizeBytes: 100})
+		}
+		if err := e.repo.BeginFinalize(ctx, j.ItemID, "qbittorrent", "Demo", m); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.repo.MarkReady(ctx, j.ItemID, "qbittorrent"); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
 
-func TestGetAndRemoveTorrent(t *testing.T) {
-	h, repo, _ := newTestServer()
-	repo.library[hash] = db.Torrent{InfoHash: hash, Status: db.StatusReady}
-	repo.files[5] = db.File{ID: 5, InfoHash: hash, Path: "Movie/movie.mkv", SizeBytes: 10}
-
-	rec := call(h, "GET", "/v1/torrents/"+strings.ToUpper(hash), userKey, "")
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Movie/movie.mkv") {
-		t.Fatalf("get: %d %s", rec.Code, rec.Body)
+func TestAuth(t *testing.T) {
+	e := newEnv(t, db.Limits{})
+	for _, key := range []string{"", "wrong"} {
+		if rec := call(e.h, "GET", "/v1/me", key, ""); rec.Code != http.StatusUnauthorized {
+			t.Errorf("key %q: status %d", key, rec.Code)
+		}
 	}
-	if rec := call(h, "GET", "/v1/torrents/xyz", userKey, ""); rec.Code != http.StatusBadRequest {
-		t.Errorf("bad hash: %d", rec.Code)
+	rec := call(e.h, "GET", "/v1/me", userKey, "")
+	me := decode(t, rec)
+	if rec.Code != 200 || me["email"] != "user@example.test" || me["usage"] == nil || me["limits"] == nil {
+		t.Fatalf("me: %d %v", rec.Code, me)
 	}
-	if rec := call(h, "GET", "/v1/torrents/"+strings.Repeat("0", 40), userKey, ""); rec.Code != http.StatusNotFound {
-		t.Errorf("not in library: %d", rec.Code)
-	}
-	if rec := call(h, "GET", "/v1/torrents", userKey, ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), hash) {
-		t.Errorf("list: %d %s", rec.Code, rec.Body)
-	}
-	if rec := call(h, "DELETE", "/v1/torrents/"+hash, userKey, ""); rec.Code != http.StatusNoContent {
-		t.Errorf("remove: %d", rec.Code)
-	}
-	if rec := call(h, "DELETE", "/v1/torrents/"+hash, userKey, ""); rec.Code != http.StatusNotFound {
-		t.Errorf("remove twice: %d", rec.Code)
+	if rec := call(e.h, "POST", "/v1/admin/blocklist", userKey, `{}`); rec.Code != http.StatusForbidden {
+		t.Fatalf("admin route as user: %d", rec.Code)
 	}
 }
 
-func TestCreateLink(t *testing.T) {
-	h, repo, _ := newTestServer()
-	repo.library[hash] = db.Torrent{InfoHash: hash, Status: db.StatusReady}
-	repo.files[5] = db.File{ID: 5, InfoHash: hash, Path: "Movie/my movie.mkv"}
+// The debrid flow: check → add → (download) → check again → links for the
+// whole item → a second user adds it instantly.
+func TestDebridFlow(t *testing.T) {
+	e := newEnv(t, db.Limits{})
+	magnetURI := "magnet:?xt=urn:btih:" + hash + "&dn=Demo"
 
-	rec := call(h, "POST", "/v1/files/5/link", userKey, "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("link: %d %s", rec.Code, rec.Body)
+	rec := call(e.h, "POST", "/v1/items/check", userKey, `{"items": ["`+magnetURI+`", "nonsense"]}`)
+	items := decode(t, rec)["items"].([]any)
+	if rec.Code != 200 || items[0].(map[string]any)["availability"] != "not_cached" || items[1].(map[string]any)["availability"] != "invalid" {
+		t.Fatalf("check before: %d %v", rec.Code, items)
 	}
-	var resp struct {
-		URL       string    `json:"url"`
-		ExpiresAt time.Time `json:"expires_at"`
+
+	rec = call(e.h, "POST", "/v1/items", userKey, `{"magnet": "`+magnetURI+`"}`)
+	added := decode(t, rec)
+	if rec.Code != http.StatusAccepted || added["status"] != "queued" || added["hash"] != hash {
+		t.Fatalf("add: %d %v", rec.Code, added)
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	id := int64(added["id"].(float64))
+
+	rec = call(e.h, "POST", fmt.Sprintf("/v1/items/%d/links", id), userKey, "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("links before ready: %d %s", rec.Code, rec.Body)
+	}
+	e.finish(t, "Demo/demo.mkv", "Demo/demo.srt")
+
+	items = decode(t, call(e.h, "POST", "/v1/items/check", adminKey, `{"items": ["`+hash+`"]}`))["items"].([]any)
+	if c := items[0].(map[string]any); c["availability"] != "cached" || len(c["files"].([]any)) != 2 {
+		t.Fatalf("check after: %v", c)
+	}
+
+	rec = call(e.h, "POST", fmt.Sprintf("/v1/items/%d/links", id), userKey, "")
+	ls := decode(t, rec)["links"].([]any)
+	if rec.Code != 200 || len(ls) != 2 || !strings.HasPrefix(ls[0].(map[string]any)["url"].(string), "http://dl.test/d/") {
+		t.Fatalf("links: %d %v", rec.Code, ls)
+	}
+	fileID := int64(ls[0].(map[string]any)["file_id"].(float64))
+	if rec := call(e.h, "POST", fmt.Sprintf("/v1/files/%d/link", fileID), userKey, ""); rec.Code != 200 {
+		t.Fatalf("file link: %d", rec.Code)
+	}
+	// Someone else's file isn't reachable.
+	if rec := call(e.h, "POST", fmt.Sprintf("/v1/files/%d/link", fileID), adminKey, ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("other user's file: %d", rec.Code)
+	}
+
+	// The admin adds the same content: instant, ready, with files.
+	rec = call(e.h, "POST", "/v1/items", adminKey, `{"magnet": "`+hash+`"}`)
+	if v := decode(t, rec); rec.Code != 200 || v["status"] != "ready" || len(v["files"].([]any)) != 2 {
+		t.Fatalf("second add: %d %v", rec.Code, v)
+	}
+
+	list := decode(t, call(e.h, "GET", "/v1/items", userKey, ""))["items"].([]any)
+	if len(list) != 1 || list[0].(map[string]any)["hash"] != hash {
+		t.Fatalf("list: %v", list)
+	}
+	if rec := call(e.h, "DELETE", fmt.Sprintf("/v1/items/%d", id), userKey, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("remove: %d", rec.Code)
+	}
+	if rec := call(e.h, "GET", fmt.Sprintf("/v1/items/%d", id), adminKey, ""); rec.Code != 200 {
+		t.Fatalf("removal must be per user: %d", rec.Code)
+	}
+}
+
+func TestEvictedLinkQueuesAgain(t *testing.T) {
+	e := newEnv(t, db.Limits{})
+	rec := call(e.h, "POST", "/v1/items", userKey, `{"magnet": "`+hash+`"}`)
+	id := int64(decode(t, rec)["id"].(float64))
+	e.finish(t, "a.mkv")
+	if err := e.repo.MarkEvicted(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
-	rest, ok := strings.CutPrefix(resp.URL, "https://torza.test/d/")
-	if !ok || !strings.HasSuffix(rest, "/my%20movie.mkv") {
-		t.Fatalf("url = %q", resp.URL)
-	}
-	token := strings.SplitN(rest, "/", 2)[0]
-	claims, err := links.NewSigner(signingKey).Verify(token)
-	if err != nil || claims.FileID != 5 || claims.UserID != 1 || !claims.Expires.Equal(resp.ExpiresAt) {
-		t.Fatalf("token claims %+v, err %v", claims, err)
-	}
-
-	repo.library[hash] = db.Torrent{InfoHash: hash, Status: db.StatusDownloading}
-	if rec := call(h, "POST", "/v1/files/5/link", userKey, ""); rec.Code != http.StatusConflict {
-		t.Errorf("not ready: %d", rec.Code)
-	}
-	if rec := call(h, "POST", "/v1/files/99/link", userKey, ""); rec.Code != http.StatusNotFound {
-		t.Errorf("unknown file: %d", rec.Code)
-	}
-	if rec := call(h, "POST", "/v1/files/abc/link", userKey, ""); rec.Code != http.StatusBadRequest {
-		t.Errorf("bad id: %d", rec.Code)
+	rec = call(e.h, "POST", fmt.Sprintf("/v1/items/%d/links", id), userKey, "")
+	if v := decode(t, rec); rec.Code != http.StatusAccepted || v["status"] != "queued" {
+		t.Fatalf("link for evicted item: %d %v", rec.Code, v)
 	}
 }
 
-func TestBlocklist(t *testing.T) {
-	h, repo, n := newTestServer()
-	body := `{"torrent": "` + hash + `", "reason": "copyright notice", "reference": "N-123"}`
+func TestTorrentFileUpload(t *testing.T) {
+	e := newEnv(t, db.Limits{})
+	info := "d6:lengthi5e4:name8:demo.txt12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaae"
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	fw, _ := w.CreateFormFile("torrent", "demo.torrent")
+	_, _ = fw.Write([]byte("d4:info" + info + "e"))
+	_ = w.Close()
+	req := httptest.NewRequest("POST", "/v1/items", &body)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+userKey)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	if v := decode(t, rec); rec.Code != http.StatusAccepted || v["name"] != "demo.txt" || len(v["hash"].(string)) != 40 {
+		t.Fatalf("upload: %d %v", rec.Code, v)
+	}
+}
 
-	if rec := call(h, "POST", "/v1/admin/blocklist", userKey, body); rec.Code != http.StatusForbidden {
-		t.Fatalf("non-admin: %d", rec.Code)
+func TestLimitsAndBlocks(t *testing.T) {
+	e := newEnv(t, db.Limits{MaxActive: 1})
+	if rec := call(e.h, "POST", "/v1/items", userKey, `{"magnet": "`+hash+`"}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("first add: %d", rec.Code)
 	}
-	if rec := call(h, "POST", "/v1/admin/blocklist", adminKey, `{"torrent": "`+hash+`"}`); rec.Code != http.StatusBadRequest {
-		t.Fatalf("missing reason: %d", rec.Code)
+	other := strings.Repeat("d", 40)
+	if rec := call(e.h, "POST", "/v1/items", userKey, `{"magnet": "`+other+`"}`); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("over the limit: %d", rec.Code)
 	}
-	if rec := call(h, "POST", "/v1/admin/blocklist", adminKey, body); rec.Code != http.StatusOK {
-		t.Fatalf("admin: %d %s", rec.Code, rec.Body)
+	// The owner raises this user's limit.
+	if rec := call(e.h, "PUT", "/v1/admin/users/1/limits", adminKey, `{"max_active": 5}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("set limits: %d %s", rec.Code, rec.Body)
 	}
-	if repo.blocked[hash] != "copyright notice" {
-		t.Fatalf("blocked = %v", repo.blocked)
+	if rec := call(e.h, "POST", "/v1/items", userKey, `{"magnet": "`+other+`"}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("after raising the limit: %d", rec.Code)
 	}
-	if len(n.blocked) != 1 || n.blocked[0] != hash {
-		t.Fatalf("ingest wasn't woken: %v", n.blocked)
+	rec := call(e.h, "POST", "/v1/admin/blocklist", adminKey, `{"torrent": "`+hash+`", "reason": "notice", "reference": "N-1"}`)
+	if rec.Code != 200 {
+		t.Fatalf("block: %d %s", rec.Code, rec.Body)
+	}
+	if rec := call(e.h, "POST", "/v1/items", adminKey, `{"magnet": "`+hash+`"}`); rec.Code != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("add blocked: %d", rec.Code)
+	}
+	items := decode(t, call(e.h, "POST", "/v1/items/check", userKey, `{"items": ["`+hash+`"]}`))["items"].([]any)
+	if items[0].(map[string]any)["availability"] != "blocked" {
+		t.Fatalf("check blocked: %v", items)
+	}
+}
+
+func TestBadInput(t *testing.T) {
+	e := newEnv(t, db.Limits{})
+	for _, c := range []struct{ method, path, body string }{
+		{"POST", "/v1/items", `{"magnet": "nope"}`},
+		{"POST", "/v1/items", `not json`},
+		{"POST", "/v1/items/check", `{"items": []}`},
+		{"POST", "/v1/items/check", `{"items": [` + strings.Repeat(`"x",`, MaxCheck) + `"x"]}`},
+		{"GET", "/v1/items/abc", ""},
+	} {
+		if rec := call(e.h, c.method, c.path, userKey, c.body); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s %s %q: %d", c.method, c.path, c.body, rec.Code)
+		}
+	}
+	if rec := call(e.h, "GET", "/v1/items/999", userKey, ""); rec.Code != http.StatusNotFound {
+		t.Errorf("unknown item: %d", rec.Code)
 	}
 }

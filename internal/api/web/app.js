@@ -21,9 +21,9 @@ const el = (tag, cls, text) => {
 let apiKey = readKey();
 let pollTimer = null;
 let firstLoad = true;
-const expanded = new Set();     // infohashes whose file list is open
-const fileCache = new Map();    // infohash -> files
-const rows = new Map();         // infohash -> <li>
+const expanded = new Set();     // item IDs whose file list is open
+const fileCache = new Map();    // item ID -> files
+const rows = new Map();         // item ID -> <li>
 let playing = { fileId: null, url: null };
 let undo = null;                // pending undo for the last removal
 
@@ -67,7 +67,8 @@ function size(bytes) {
 function statusLabel(t) {
   switch (t.status) {
     case "queued": return "Queued";
-    case "downloading": return "Downloading " + Math.floor((t.progress || 0) * 100) + "%";
+    case "active": return t.phase === "metadata" ? "Finding peers" : "Downloading " + Math.floor((t.progress || 0) * 100) + "%";
+    case "finalizing": return "Moving into the cache";
     case "ready": return "Ready";
     case "failed": return "Failed";
     case "evicted": return "Removed from cache";
@@ -140,12 +141,12 @@ async function poll() {
   stopPolling();
   let next = SLOW_POLL;
   try {
-    const body = await api("/v1/torrents");
-    const list = (body && body.torrents) || [];
+    const body = await api("/v1/items");
+    const list = (body && body.items) || [];
     $("banner").hidden = true;
     renderLibrary(list);
     $("lib-updated").textContent = "Updated " + new Date().toLocaleTimeString();
-    if (list.some((t) => t.status === "queued" || t.status === "downloading")) next = FAST_POLL;
+    if (list.some(inProgress)) next = FAST_POLL;
   } catch (e) {
     if (e.status === 401) return;
     if (!(e instanceof APIError)) console.error(e);
@@ -173,8 +174,8 @@ function renderLibrary(list) {
   ul.setAttribute("aria-busy", "false");
   ul.querySelector(".empty")?.remove();
 
-  const seen = new Set(list.map((t) => t.infohash));
-  for (const [hash, li] of rows) if (!seen.has(hash)) { li.remove(); rows.delete(hash); }
+  const seen = new Set(list.map((t) => t.id));
+  for (const [id, li] of rows) if (!seen.has(id)) { li.remove(); rows.delete(id); }
 
   if (list.length === 0) {
     const li = el("li", "empty");
@@ -184,16 +185,18 @@ function renderLibrary(list) {
   }
 
   list.forEach((t, i) => {
-    let li = rows.get(t.infohash);
-    if (!li) { li = buildRow(t.infohash); rows.set(t.infohash, li); }
+    let li = rows.get(t.id);
+    if (!li) { li = buildRow(t.id); rows.set(t.id, li); }
     if (ul.children[i] !== li) ul.insertBefore(li, ul.children[i] || null);
     updateRow(li, t);
   });
 }
 
-function buildRow(hash) {
+function inProgress(t) { return t.status === "queued" || t.status === "active" || t.status === "finalizing"; }
+
+function buildRow(id) {
   const li = el("li", "item");
-  li.dataset.hash = hash;
+  li.dataset.id = String(id);
   const head = el("div", "item-head");
   const main = el("div", "item-main");
   main.append(el("p", "item-name"), el("p", "item-meta"));
@@ -209,13 +212,13 @@ function updateRow(li, t) {
 
   const meta = li.querySelector(".item-meta");
   const badge = el("span", "status " + t.status, statusLabel(t));
-  const hash = el("span", "hash", t.infohash.slice(0, 12) + "…");
-  hash.title = t.infohash;
+  const hash = el("span", "hash", (t.hash || "").slice(0, 12) + "…");
+  hash.title = t.hash || "";
   meta.replaceChildren(badge, " · " + size(t.size_bytes) + " · ", hash);
 
   // Progress bar while downloading.
   let bar = li.querySelector(".bar");
-  if (t.status === "downloading" || t.status === "queued") {
+  if (inProgress(t)) {
     if (!bar) { bar = el("progress", "bar"); bar.max = 100; li.querySelector(".item-main").append(bar); }
     bar.value = Math.floor((t.progress || 0) * 100);
     bar.setAttribute("aria-label", "Download progress for " + name);
@@ -234,56 +237,56 @@ function updateRow(li, t) {
     actions.dataset.status = t.status;
     actions.replaceChildren();
     if (t.status === "ready") {
-      const toggle = el("button", "btn btn-secondary btn-sm", expanded.has(t.infohash) ? "Hide files" : "Show files");
+      const toggle = el("button", "btn btn-secondary btn-sm", expanded.has(t.id) ? "Hide files" : "Show files");
       toggle.type = "button";
-      toggle.setAttribute("aria-expanded", expanded.has(t.infohash) ? "true" : "false");
-      toggle.addEventListener("click", () => toggleFiles(li, t.infohash, toggle));
+      toggle.setAttribute("aria-expanded", expanded.has(t.id) ? "true" : "false");
+      toggle.addEventListener("click", () => toggleFiles(li, t.id, toggle));
       actions.append(toggle);
     }
     if (t.status === "evicted" || t.status === "failed") {
       const again = el("button", "btn btn-secondary btn-sm", "Download again");
       again.type = "button";
-      again.addEventListener("click", () => readd(t.infohash, again));
+      again.addEventListener("click", () => readd(t.hash, t.id, again));
       actions.append(again);
     }
     const rm = el("button", "btn btn-danger btn-sm", "Remove");
     rm.type = "button";
     rm.setAttribute("aria-label", "Remove " + name + " from your library");
-    rm.addEventListener("click", () => removeItem(t.infohash, li));
+    rm.addEventListener("click", () => removeItem(t.id, t.hash, li));
     actions.append(rm);
   }
 
   // Files: shown while the item is ready and its list is open.
   if (t.status !== "ready") { li.querySelector(".files")?.remove(); }
-  else if (expanded.has(t.infohash) && !li.querySelector(".files")) loadFiles(li, t.infohash);
+  else if (expanded.has(t.id) && !li.querySelector(".files")) loadFiles(li, t.id);
 }
 
-async function toggleFiles(li, hash, btn) {
-  if (expanded.has(hash)) {
-    expanded.delete(hash);
+async function toggleFiles(li, id, btn) {
+  if (expanded.has(id)) {
+    expanded.delete(id);
     li.querySelector(".files")?.remove();
     btn.textContent = "Show files"; btn.setAttribute("aria-expanded", "false");
     return;
   }
-  expanded.add(hash);
+  expanded.add(id);
   btn.textContent = "Hide files"; btn.setAttribute("aria-expanded", "true");
-  await loadFiles(li, hash);
+  await loadFiles(li, id);
 }
 
-async function loadFiles(li, hash) {
+async function loadFiles(li, id) {
   let ul = li.querySelector(".files");
   if (!ul) { ul = el("ul", "files"); li.append(ul); }
-  if (!fileCache.has(hash)) {
+  if (!fileCache.has(id)) {
     ul.replaceChildren(el("li", "file muted small", "Loading files…"));
     try {
-      const t = await api("/v1/torrents/" + encodeURIComponent(hash));
-      fileCache.set(hash, (t && t.files) || []);
+      const t = await api("/v1/items/" + id);
+      fileCache.set(id, (t && t.files) || []);
     } catch (e) {
       ul.replaceChildren(el("li", "file item-error", "Couldn't load the file list: " + e.message));
       return;
     }
   }
-  const files = fileCache.get(hash);
+  const files = fileCache.get(id);
   if (!files.length) { ul.replaceChildren(el("li", "file muted small", "This torrent has no files.")); return; }
   const sorted = [...files].sort((a, b) => (VIDEO.test(b.path) - VIDEO.test(a.path)) || (b.size_bytes - a.size_bytes));
   ul.replaceChildren(...sorted.map(fileRow));
@@ -327,11 +330,12 @@ $("add-form").addEventListener("submit", async (ev) => {
   btn.disabled = true; btn.textContent = "Adding…";
   setAddMsg("", "");
   try {
-    const t = await api("/v1/torrents", { method: "POST", body: JSON.stringify({ magnet: value }) });
+    const t = await api("/v1/items", { method: "POST", body: JSON.stringify({ magnet: value }) });
     $("magnet").value = "";
+    clearTimeout(checkTimer); checkSeq++; setAvail("", "");
     const what = t.name || "the torrent";
     setAddMsg(t.status === "ready" ? "Added " + what + ". It was already cached, so it's ready now." : "Added " + what + ". Progress shows in your library below.", "ok");
-    if (t.status === "ready") expanded.add(t.infohash);
+    if (t.status === "ready") expanded.add(t.id);
     poll();
   } catch (e) {
     if (e.status === 400) setAddMsg("That isn't a magnet link or info hash. Paste one that starts with magnet:?xt=urn:btih:, or a 40-character hash.", "error");
@@ -341,22 +345,60 @@ $("add-form").addEventListener("submit", async (ev) => {
   }
 });
 
-async function readd(hash, btn) {
+// ── Availability, like a debrid service's "instant" check ─────────────────
+
+let checkTimer = null;
+let checkSeq = 0;
+const LOOKS_ADDABLE = /^(magnet:\?|[0-9a-f]{40}$|[a-z2-7]{32}$)/i;
+
+function setAvail(text, kind) {
+  const a = $("avail");
+  a.textContent = text; a.hidden = !text;
+  a.className = "field-msg avail" + (kind ? " is-" + kind : "");
+}
+
+$("magnet").addEventListener("input", () => {
+  clearTimeout(checkTimer);
+  const value = $("magnet").value.trim();
+  if (!LOOKS_ADDABLE.test(value)) { setAvail("", ""); return; }
+  checkTimer = setTimeout(() => checkAvailability(value), 350);
+});
+
+async function checkAvailability(value) {
+  const seq = ++checkSeq;
+  setAvail("Checking the cache…", "");
+  try {
+    const r = await api("/v1/items/check", { method: "POST", body: JSON.stringify({ items: [value] }) });
+    if (seq !== checkSeq) return; // the field changed meanwhile
+    const c = r.items[0];
+    switch (c.availability) {
+      case "cached": setAvail("Cached: ready instantly. " + (c.name || "") + " (" + size(c.size_bytes) + ", " + c.files.length + (c.files.length === 1 ? " file)" : " files)"), "ok"); break;
+      case "downloading": setAvail("Someone is already downloading this. Adding it is free; it joins your library and becomes ready with theirs.", ""); break;
+      case "not_cached": setAvail("Not cached yet. Adding it starts a download, which counts toward your active downloads.", ""); break;
+      case "blocked": setAvail("This was removed after a takedown request and can't be added.", "error"); break;
+      default: setAvail("", "");
+    }
+  } catch (e) {
+    if (seq === checkSeq) setAvail("", "");
+  }
+}
+
+async function readd(hash, id, btn) {
   btn.disabled = true; btn.textContent = "Adding…";
-  try { await api("/v1/torrents", { method: "POST", body: JSON.stringify({ magnet: hash }) }); fileCache.delete(hash); poll(); }
+  try { await api("/v1/items", { method: "POST", body: JSON.stringify({ magnet: hash }) }); fileCache.delete(id); poll(); }
   catch (e) { if (e.status !== 401) showToast(e.message, null); btn.disabled = false; btn.textContent = "Download again"; }
 }
 
-async function removeItem(hash, li) {
+async function removeItem(id, hash, li) {
   const name = li.querySelector(".item-name").textContent;
   li.hidden = true;
   try {
-    await api("/v1/torrents/" + encodeURIComponent(hash), { method: "DELETE" });
-    rows.delete(hash); li.remove(); expanded.delete(hash); fileCache.delete(hash);
-    showToast("Removed " + name + " from your library.", async () => {
-      await api("/v1/torrents", { method: "POST", body: JSON.stringify({ magnet: hash }) });
+    await api("/v1/items/" + id, { method: "DELETE" });
+    rows.delete(id); li.remove(); expanded.delete(id); fileCache.delete(id);
+    showToast("Removed " + name + " from your library.", hash && (async () => {
+      await api("/v1/items", { method: "POST", body: JSON.stringify({ magnet: hash }) });
       poll();
-    });
+    }));
     poll();
   } catch (e) {
     li.hidden = false;

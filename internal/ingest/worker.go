@@ -1,5 +1,9 @@
-// Package ingest drives downloads. It hands queued torrents to qBittorrent,
-// records their progress, and moves finished torrents into the cache.
+// Package ingest fills the cache. One Worker runs one fetcher (qBittorrent
+// today): it claims queued items for that fetcher, drives them through the
+// source, and moves finished files into the cache.
+//
+// An item with a handle belongs to the worker of its fetcher. Only that
+// worker deletes what the fetcher wrote, including after a takedown.
 package ingest
 
 import (
@@ -7,55 +11,56 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"torza/internal/db"
-	"torza/internal/qbit"
+	"torza/internal/source"
 	"torza/internal/store"
 )
 
-// Repo is the part of the database ingest needs.
+// Repo is the part of the database ingest needs. *db.Repo implements it.
 type Repo interface {
-	TorrentsByStatus(ctx context.Context, statuses ...string) ([]db.Torrent, error)
-	BlockedUnpurged(ctx context.Context) ([]db.Torrent, error)
-	MarkDownloading(ctx context.Context, infohash string) error
-	UpdateProgress(ctx context.Context, infohash, name string, size int64, progress float64) error
-	MarkReady(ctx context.Context, infohash, name string, size int64, files []db.FileInput) error
-	MarkFailed(ctx context.Context, infohash, reason string) error
-	MarkPurged(ctx context.Context, infohash string) error
-}
-
-// Engine is the torrent client. *qbit.Client implements it.
-type Engine interface {
-	Add(ctx context.Context, magnetURI, savePath string) error
-	Info(ctx context.Context, hashes []string) ([]qbit.Torrent, error)
-	Files(ctx context.Context, hash string) ([]qbit.File, error)
-	Delete(ctx context.Context, hashes []string, deleteFiles bool) error
+	Claim(ctx context.Context, fetcher string, n int, defaultMaxBytes int64) ([]db.Job, error)
+	Held(ctx context.Context, fetcher string, defaultMaxBytes int64) ([]db.Job, error)
+	SetHandle(ctx context.Context, itemID int64, fetcher string, handle []byte) error
+	Progress(ctx context.Context, itemID int64, fetcher, phase, name string, size int64, progress float64) error
+	BeginFinalize(ctx context.Context, itemID int64, fetcher, name string, files []db.ManifestFile) error
+	MarkReady(ctx context.Context, itemID int64, fetcher string) error
+	Fail(ctx context.Context, itemID int64, fetcher, reason string) error
+	RequeueHeld(ctx context.Context, itemID int64, fetcher, reason string) error
+	BlockedHeld(ctx context.Context, fetcher string) ([]db.Job, error)
+	PurgedHeld(ctx context.Context, itemID int64, fetcher string) error
+	LegacyFolders(ctx context.Context) (map[int64]string, error)
+	LegacyFolderDone(ctx context.Context, itemID int64) error
 }
 
 type Config struct {
-	MaxTorrentBytes int64         // 0 = no limit
-	MetadataTimeout time.Duration // 0 = wait forever for peers
+	MaxItemBytes int64 // server default for users without their own limit; 0 = none
+	ClaimBatch   int   // most items claimed per tick
+	Policy       Policy
 }
 
 type Worker struct {
-	repo   Repo
-	engine Engine
-	store  store.Store
-	cfg    Config
-	log    *slog.Logger
-	now    func() time.Time
+	repo  Repo
+	src   source.Source
+	store store.Store
+	cfg   Config
+	log   *slog.Logger
+	now   func() time.Time
 }
 
-func New(repo Repo, engine Engine, st store.Store, cfg Config, log *slog.Logger) *Worker {
-	return &Worker{repo: repo, engine: engine, store: st, cfg: cfg, log: log, now: time.Now}
+func New(repo Repo, src source.Source, st store.Store, cfg Config, log *slog.Logger) *Worker {
+	if cfg.ClaimBatch <= 0 {
+		cfg.ClaimBatch = 50
+	}
+	return &Worker{repo: repo, src: src, store: st, cfg: cfg, log: log.With("fetcher", src.Name()), now: time.Now}
 }
 
 // Run checks for work every interval, or sooner when wake fires, until ctx ends.
 func (w *Worker) Run(ctx context.Context, interval time.Duration, wake <-chan struct{}) {
+	if err := w.adoptLegacy(ctx); err != nil {
+		w.log.Error("convert old cache folders", "err", err)
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -71,179 +76,182 @@ func (w *Worker) Run(ctx context.Context, interval time.Duration, wake <-chan st
 	}
 }
 
-// Tick does one round of work: delete blocked torrents, start queued ones,
-// and update downloading ones. One failing step doesn't stop the others.
+// Tick does one round: stop blocked work, move held items along (which also
+// recovers anything a crash interrupted), then claim and start new work.
+// One failing step doesn't stop the others.
 func (w *Worker) Tick(ctx context.Context) error {
-	return errors.Join(w.purgeBlocked(ctx), w.startQueued(ctx), w.trackDownloads(ctx))
-}
-
-func (w *Worker) purgeBlocked(ctx context.Context) error {
-	ts, err := w.repo.BlockedUnpurged(ctx)
-	if err != nil {
-		return err
+	errs := []error{w.purgeBlocked(ctx)}
+	held, err := w.repo.Held(ctx, w.src.Name(), w.cfg.MaxItemBytes)
+	errs = append(errs, err)
+	for _, j := range held {
+		errs = append(errs, w.step(ctx, j))
 	}
-	var errs []error
-	for _, t := range ts {
-		if err := errors.Join(
-			w.engine.Delete(ctx, []string{t.InfoHash}, true),
-			w.store.Remove(t.InfoHash),
-		); err != nil {
-			errs = append(errs, fmt.Errorf("purge %s: %w", t.InfoHash, err))
-			continue
-		}
-		if err := w.repo.MarkPurged(ctx, t.InfoHash); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		w.log.Info("deleted blocked torrent", "infohash", t.InfoHash)
+	claimed, err := w.repo.Claim(ctx, w.src.Name(), w.cfg.ClaimBatch, w.cfg.MaxItemBytes)
+	errs = append(errs, err)
+	for _, j := range claimed {
+		errs = append(errs, w.step(ctx, j))
 	}
 	return errors.Join(errs...)
 }
 
-func (w *Worker) startQueued(ctx context.Context) error {
-	ts, err := w.repo.TorrentsByStatus(ctx, db.StatusQueued)
-	if err != nil {
-		return err
-	}
-	var errs []error
-	for _, t := range ts {
-		dir := w.store.IncomingDir(t.InfoHash)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if err := w.engine.Add(ctx, t.Magnet, dir); err != nil && !w.inEngine(ctx, t.InfoHash) {
-			// qBittorrent refuses torrents it already has; that's fine.
-			errs = append(errs, fmt.Errorf("start %s: %w", t.InfoHash, err))
-			continue
-		}
-		if err := w.repo.MarkDownloading(ctx, t.InfoHash); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		w.log.Info("download started", "infohash", t.InfoHash, "name", t.Name)
-	}
-	return errors.Join(errs...)
+func (w *Worker) job(j db.Job) source.Job {
+	return source.Job{ItemID: j.ItemID, Key: j.Key, Payload: j.Payload, Handle: j.Handle, Dir: w.store.IncomingDir(j.ItemID)}
 }
 
-func (w *Worker) trackDownloads(ctx context.Context) error {
-	ts, err := w.repo.TorrentsByStatus(ctx, db.StatusDownloading)
-	if err != nil || len(ts) == 0 {
-		return err
+// step moves one held item along and handles what goes wrong.
+func (w *Worker) step(ctx context.Context, j db.Job) error {
+	var err error
+	if j.Status == db.StatusFinalizing {
+		err = w.recoverFinalizing(ctx, j)
+	} else {
+		err = w.advance(ctx, j)
 	}
-	hashes := make([]string, len(ts))
-	for i, t := range ts {
-		hashes[i] = t.InfoHash
-	}
-	infos, err := w.engine.Info(ctx, hashes)
-	if err != nil {
-		return err
-	}
-	byHash := make(map[string]qbit.Torrent, len(infos))
-	for _, in := range infos {
-		byHash[strings.ToLower(in.Hash)] = in
-	}
-
-	var errs []error
-	for _, t := range ts {
-		in, ok := byHash[t.InfoHash]
-		if !ok {
-			// qBittorrent lost it (for example its state was reset): hand it over again.
-			w.log.Warn("torrent missing from qBittorrent, re-adding", "infohash", t.InfoHash)
-			if err := w.engine.Add(ctx, t.Magnet, w.store.IncomingDir(t.InfoHash)); err != nil {
-				errs = append(errs, fmt.Errorf("re-add %s: %w", t.InfoHash, err))
-			}
-			continue
-		}
-		if err := w.track(ctx, t, in); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", t.InfoHash, err))
-		}
-	}
-	return errors.Join(errs...)
-}
-
-func (w *Worker) track(ctx context.Context, t db.Torrent, in qbit.Torrent) error {
-	size := in.TotalSize
 	switch {
-	case in.State == "error" || in.State == "missingFiles":
-		return w.fail(ctx, t.InfoHash, "torrent engine reported: "+in.State)
-	case size <= 0:
-		// Still fetching the file list (metadata) from peers.
-		if w.cfg.MetadataTimeout > 0 && w.now().Sub(time.Unix(in.AddedOn, 0)) > w.cfg.MetadataTimeout {
-			return w.fail(ctx, t.InfoHash, "no peers found for this torrent")
-		}
+	case err == nil, errors.Is(err, db.ErrConflict):
+		// ErrConflict: blocked meanwhile; purgeBlocked cleans up next tick.
 		return nil
-	case w.cfg.MaxTorrentBytes > 0 && size > w.cfg.MaxTorrentBytes:
-		return w.fail(ctx, t.InfoHash, fmt.Sprintf("torrent is %s; the limit is %s", humanBytes(size), humanBytes(w.cfg.MaxTorrentBytes)))
-	case in.Progress >= 1 && !busy(in.State):
-		return w.finish(ctx, t, in)
+	case source.ClassOf(err) == source.Retry:
+		return fmt.Errorf("item %d: %w", j.ItemID, err)
 	default:
-		return w.repo.UpdateProgress(ctx, t.InfoHash, in.Name, size, in.Progress)
+		return w.fail(ctx, j, source.Message(err))
 	}
 }
 
-// busy reports qBittorrent states where the files may still change even at
-// 100% progress.
-func busy(state string) bool {
-	return strings.HasPrefix(state, "checking") || state == "moving" || state == "metaDL" || state == "allocating"
-}
-
-func (w *Worker) finish(ctx context.Context, t db.Torrent, in qbit.Torrent) error {
-	files, err := w.engine.Files(ctx, t.InfoHash)
+func (w *Worker) advance(ctx context.Context, j db.Job) error {
+	sj := w.job(j)
+	if sj.Handle == nil {
+		// Claimed but not started, or a crash came before the handle was
+		// stored: Start again. Sources make a second Start harmless.
+		h, err := w.src.Start(ctx, sj)
+		if err != nil {
+			return err
+		}
+		if err := w.repo.SetHandle(ctx, j.ItemID, w.src.Name(), h); err != nil {
+			return err
+		}
+		sj.Handle = h
+		w.log.Info("download started", "item", j.ItemID, "key", j.Key.Value)
+	}
+	r, err := w.src.Poll(ctx, sj)
 	if err != nil {
 		return err
 	}
-	if len(files) == 0 {
-		return errors.New("finished torrent reports no files")
+	if d := w.cfg.Policy.Decide(j, r, w.now()); d.Fail != "" {
+		return source.Fail(source.Permanent, d.Fail)
 	}
-	inputs := make([]db.FileInput, 0, len(files))
-	for _, f := range files {
-		if !filepath.IsLocal(filepath.FromSlash(f.Name)) {
-			return w.fail(ctx, t.InfoHash, "torrent contains an unsafe file path")
-		}
-		inputs = append(inputs, db.FileInput{Path: f.Name, SizeBytes: f.Size})
+	if r.Done {
+		return w.finish(ctx, j, sj)
 	}
+	progress := 0.0
+	if r.BytesTotal > 0 {
+		progress = float64(r.BytesDone) / float64(r.BytesTotal)
+	}
+	return w.repo.Progress(ctx, j.ItemID, w.src.Name(), r.Phase, r.Name, r.BytesTotal, progress)
+}
 
-	// Remove the torrent from qBittorrent but keep its files. That stops
-	// seeding and releases the files so they can be moved.
-	if err := w.engine.Delete(ctx, []string{t.InfoHash}, false); err != nil {
+// finish stores the manifest before the source lets go of the files, so a
+// crash at any later point is finished from the database and the disk:
+//  1. Finalize: the final file list.
+//  2. One transaction: file rows (pending) and status finalizing.
+//  3. The source releases the files; 4. rename into store/; 5. ready.
+func (w *Worker) finish(ctx context.Context, j db.Job, sj source.Job) error {
+	m, err := w.src.Finalize(ctx, sj)
+	if err != nil {
 		return err
 	}
-	if err := w.store.Publish(t.InfoHash); err != nil {
+	if err := store.CheckManifest(m.Root, m.Files); err != nil {
+		return &source.Error{Class: source.Permanent, Msg: "the download contains unsafe or unexpected files", Err: err}
+	}
+	if err := w.repo.BeginFinalize(ctx, j.ItemID, w.src.Name(), m.Name, m.Files); err != nil {
 		return err
 	}
-	if err := w.repo.MarkReady(ctx, t.InfoHash, in.Name, in.TotalSize, inputs); err != nil {
-		// ErrConflict: it was blocked mid-download. purgeBlocked deletes the files.
+	return w.publish(ctx, j, sj, m.Root)
+}
+
+func (w *Worker) publish(ctx context.Context, j db.Job, sj source.Job, root string) error {
+	if err := w.src.Release(ctx, sj); err != nil {
 		return err
 	}
-	w.log.Info("download ready", "infohash", t.InfoHash, "files", len(inputs), "bytes", in.TotalSize)
+	if err := w.store.Publish(root, j.ItemID); err != nil {
+		return err
+	}
+	if err := w.repo.MarkReady(ctx, j.ItemID, w.src.Name()); err != nil {
+		return err
+	}
+	w.log.Info("download ready", "item", j.ItemID)
 	return nil
 }
 
+// recoverFinalizing finishes an item a crash left finalizing, from what is
+// on disk: already in store/ → ready; still in its download folder →
+// release, rename, ready; neither → download it again.
+func (w *Worker) recoverFinalizing(ctx context.Context, j db.Job) error {
+	sj := w.job(j)
+	if w.store.Published(j.ItemID) {
+		return w.repo.MarkReady(ctx, j.ItemID, w.src.Name())
+	}
+	root, err := w.src.Root(sj)
+	if err != nil {
+		return err
+	}
+	if store.Exists(root) {
+		return w.publish(ctx, j, sj, root)
+	}
+	w.log.Warn("finished download vanished before it was moved; downloading again", "item", j.ItemID)
+	return w.repo.RequeueHeld(ctx, j.ItemID, w.src.Name(), "")
+}
+
 // fail stops a download, deletes its partial files and records why.
-func (w *Worker) fail(ctx context.Context, infohash, reason string) error {
-	w.log.Warn("download failed", "infohash", infohash, "reason", reason)
-	return errors.Join(
-		w.engine.Delete(ctx, []string{infohash}, true),
-		w.store.Remove(infohash),
-		w.repo.MarkFailed(ctx, infohash, reason),
-	)
+func (w *Worker) fail(ctx context.Context, j db.Job, reason string) error {
+	w.log.Warn("download failed", "item", j.ItemID, "reason", reason)
+	err := errors.Join(w.src.Cancel(ctx, w.job(j), true), w.store.Remove(j.ItemID))
+	if err != nil {
+		return fmt.Errorf("item %d: clean up failed download: %w", j.ItemID, err)
+	}
+	if err := w.repo.Fail(ctx, j.ItemID, w.src.Name(), reason); err != nil && !errors.Is(err, db.ErrConflict) {
+		return err
+	}
+	return nil
 }
 
-func (w *Worker) inEngine(ctx context.Context, infohash string) bool {
-	infos, err := w.engine.Info(ctx, []string{infohash})
-	return err == nil && len(infos) > 0
+// purgeBlocked stops blocked downloads this fetcher holds and deletes their
+// files.
+func (w *Worker) purgeBlocked(ctx context.Context) error {
+	jobs, err := w.repo.BlockedHeld(ctx, w.src.Name())
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, j := range jobs {
+		if err := errors.Join(w.src.Cancel(ctx, w.job(j), true), w.store.Remove(j.ItemID)); err != nil {
+			errs = append(errs, fmt.Errorf("purge item %d: %w", j.ItemID, err))
+			continue
+		}
+		if err := w.repo.PurgedHeld(ctx, j.ItemID, w.src.Name()); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		w.log.Info("deleted blocked download", "item", j.ItemID)
+	}
+	return errors.Join(errs...)
 }
 
-func humanBytes(n int64) string {
-	const unit = 1000
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
+// adoptLegacy renames finished folders from the old torrent-only layout.
+func (w *Worker) adoptLegacy(ctx context.Context) error {
+	folders, err := w.repo.LegacyFolders(ctx)
+	if err != nil {
+		return err
 	}
-	div, exp := int64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
+	var errs []error
+	for id, folder := range folders {
+		if err := w.store.AdoptLegacy(id, folder); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		errs = append(errs, w.repo.LegacyFolderDone(ctx, id))
 	}
-	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "kMGTPE"[exp])
+	if len(folders) > 0 {
+		w.log.Info("converted old cache folders", "count", len(folders))
+	}
+	return errors.Join(errs...)
 }

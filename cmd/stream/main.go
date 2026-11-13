@@ -6,6 +6,7 @@ import (
 	"torza/internal/db"
 	"torza/internal/links"
 	"torza/internal/run"
+	"torza/internal/service"
 	"torza/internal/store"
 	"torza/internal/stream"
 )
@@ -31,7 +32,9 @@ func main() {
 		run.Fatal(log, "migrate", err)
 	}
 
-	srv := stream.New(db.NewRepo(pool), links.NewSigner(cfg.SigningKey), store.New(cfg.DataDir), log)
+	signer := links.NewSigner(cfg.SigningKey)
+	svc := service.New(db.NewRepo(pool), signer, service.Config{PublicURL: cfg.PublicURL, LinkTTL: cfg.LinkTTL})
+	srv := stream.New(svc, signer, store.New(cfg.DataDir), log)
 	if err := run.ServeHTTP(ctx, log, cfg.StreamAddr, srv.Handler()); err != nil {
 		run.Fatal(log, "http", err)
 	}

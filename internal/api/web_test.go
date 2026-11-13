@@ -7,7 +7,7 @@ import (
 )
 
 func TestWebPageServed(t *testing.T) {
-	h, _, _ := newTestServer()
+	h := webServer()
 	for _, tc := range []struct{ path, contentType, contains string }{
 		{"/", "text/html", `<script src="/ui/app.js"`},
 		{"/ui/app.js", "text/javascript", "textContent"},
@@ -31,11 +31,11 @@ func TestWebPageServed(t *testing.T) {
 }
 
 func TestWebPageNeedsNoKeyButAPIStillDoes(t *testing.T) {
-	h, _, _ := newTestServer()
+	h := webServer()
 	if rec := call(h, http.MethodGet, "/", "", ""); rec.Code != http.StatusOK {
 		t.Fatalf("page: status %d", rec.Code)
 	}
-	if rec := call(h, http.MethodGet, "/v1/torrents", "", ""); rec.Code != http.StatusUnauthorized {
+	if rec := call(h, http.MethodGet, "/v1/items", "", ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("API without key: status %d, want 401", rec.Code)
 	}
 	if rec := call(h, http.MethodGet, "/ui/nothing.js", "", ""); rec.Code != http.StatusNotFound {

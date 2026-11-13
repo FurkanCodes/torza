@@ -1,12 +1,13 @@
 # Torza
 
-A cloud torrent service. Add a magnet link and get fast HTTPS links to
-download or stream the files. Each torrent is downloaded once and shared by
-every user who adds it.
+A small, private debrid service. Check whether content is already cached,
+add a magnet link or .torrent file, and get direct HTTP links to download or
+stream its files. Each item is downloaded once and shared by every user who
+adds it; adding something cached is instant.
 
-**Status: early.** The code builds and its unit tests pass, but it hasn't run
-against real Postgres, NATS and qBittorrent yet. The database queries in
-particular need testing against a real database before launch.
+**Status: early.** It runs locally on a Mac with Docker (below) and its
+database tests run against a real Postgres, but it hasn't been deployed to a
+server yet. Design: [docs/designs/torza.md](docs/designs/torza.md).
 
 How it works: [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -15,17 +16,19 @@ How it works: [ARCHITECTURE.md](ARCHITECTURE.md).
 ```
 cmd/            the four programs: api, stream, ingest, scheduler
 internal/
-  api/          REST API handlers
+  api/          REST API handlers and the test web page
+  service/      rules shared by the API and the stream service
   stream/       file serving with range support
-  ingest/       download pipeline (drives qBittorrent)
-  scheduler/    cache eviction
-  db/           Postgres queries and migrations
+  ingest/       download loop: one per fetcher, crash recovery, policy
+  source/       the interface every fetcher fits; qbitsource (qBittorrent)
+  scheduler/    eviction, takedown purges, orphan-folder sweep
+  db/           Postgres queries, migrations, LISTEN/NOTIFY wake-ups
+  dbtest/       per-test Postgres schemas for database tests
   qbit/         qBittorrent Web API client
   links/        signed download links
-  magnet/       magnet link parsing
+  magnet/       magnet link and .torrent file parsing
   store/        cache folders on disk
   auth/         API keys
-  jobs/         NATS wake-up messages
   config/       environment settings
   run/          shared startup code
 deploy/         docker-compose, Caddy, example settings
@@ -34,9 +37,17 @@ deploy/         docker-compose, Caddy, example settings
 ## Development
 
 ```sh
-go test ./...   # unit tests; no database, network or torrents needed
+go test ./...   # database tests skip without TEST_DATABASE_URL
 go vet ./...
 go build ./...
+```
+
+Database tests need a Postgres; a throwaway one:
+
+```sh
+docker run -d --rm --name torza-testpg -e POSTGRES_USER=torza -e POSTGRES_PASSWORD=torza \
+  -e POSTGRES_DB=torza_test -p 127.0.0.1:55432:5432 postgres:17-alpine
+TEST_DATABASE_URL='postgres://torza:torza@127.0.0.1:55432/torza_test?sslmode=disable' go test -race ./...
 ```
 
 ## API
@@ -45,25 +56,31 @@ All `/v1` requests need `Authorization: Bearer <api key>`.
 
 | Method | Path | Does |
 |--------|------|------|
-| `GET` | `/v1/me` | Who you are |
-| `POST` | `/v1/torrents` | Add a torrent: `{"magnet": "magnet:?xt=urn:btih:..."}` (a bare info hash also works) |
-| `GET` | `/v1/torrents` | Your library |
-| `GET` | `/v1/torrents/{infohash}` | One torrent, with its files once ready |
-| `DELETE` | `/v1/torrents/{infohash}` | Remove from your library |
-| `POST` | `/v1/files/{id}/link` | Get a signed download link: `{"url": ..., "expires_at": ...}` |
-| `POST` | `/v1/admin/blocklist` | Admins: takedown. `{"torrent": "<magnet or hash>", "reason": "...", "reference": "..."}` |
+| `GET` | `/v1/me` | Who you are, your limits, active downloads and library size |
+| `POST` | `/v1/items/check` | Is it cached? `{"items": ["<magnet or hash>", ...]}` (up to 100) → `cached` (with files), `downloading`, `not_cached`, `blocked` or `invalid` per input. Starts nothing. |
+| `POST` | `/v1/items` | Add: `{"magnet": "magnet:?xt=urn:btih:..."}` (a bare info hash works), or a multipart upload with the `.torrent` file in field `torrent`. `200` = already cached, ready now; `202` = download started |
+| `GET` | `/v1/items` | Your library |
+| `GET` | `/v1/items/{id}` | One item, with its files once ready |
+| `DELETE` | `/v1/items/{id}` | Remove from your library (the cached copy stays for others) |
+| `POST` | `/v1/items/{id}/links` | Signed links for every file of a ready item |
+| `POST` | `/v1/files/{id}/link` | A signed link for one file: `{"url": ..., "expires_at": ...}` |
+| `POST` | `/v1/admin/blocklist` | Owner: takedown. `{"torrent": "<magnet or hash>", "reason": "...", "reference": "..."}` |
+| `PUT` | `/v1/admin/users/{id}/limits` | Owner: `{"max_active": 3, "max_item_bytes": 50000000000, "priority": 0}`; `null` = server default |
 
 Example:
 
 ```sh
-curl -H "Authorization: Bearer $KEY" -d '{"magnet":"magnet:?xt=urn:btih:..."}' https://torza.example.com/v1/torrents
-curl -H "Authorization: Bearer $KEY" https://torza.example.com/v1/torrents/<infohash>
-curl -H "Authorization: Bearer $KEY" -X POST https://torza.example.com/v1/files/<file id>/link
+curl -H "Authorization: Bearer $KEY" -d '{"items":["<hash>"]}' http://localhost:8080/v1/items/check
+curl -H "Authorization: Bearer $KEY" -d '{"magnet":"magnet:?xt=urn:btih:..."}' http://localhost:8080/v1/items
+curl -H "Authorization: Bearer $KEY" -F torrent=@file.torrent http://localhost:8080/v1/items
+curl -H "Authorization: Bearer $KEY" -X POST http://localhost:8080/v1/items/<id>/links
 ```
 
-Error codes worth knowing: `429` means you have too many downloads running,
-`451` means the torrent was removed after a takedown, and `410` from a download
-link means it expired (create a new one).
+Status codes worth knowing: `202` from a link request means the item had
+been evicted and is downloading again (ask again when it's ready); `429`
+means you have as many downloads running as your limit allows; `451` means
+the content was removed after a takedown; `410` from a download link means it
+expired (make a new one).
 
 ## Running locally (Mac)
 

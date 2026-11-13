@@ -6,80 +6,112 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"torza/internal/db"
 )
 
-func TestFilePath(t *testing.T) {
-	s := New(t.TempDir())
-	ih := strings.Repeat("a", 40)
-
-	for _, ok := range []string{"file.iso", "Movie/movie.mkv", "a/b/c.txt"} {
-		p, err := s.FilePath(ih, ok)
-		if err != nil {
-			t.Errorf("FilePath(%q): %v", ok, err)
-			continue
-		}
-		if !strings.HasPrefix(p, s.TorrentDir(ih)+string(filepath.Separator)) {
-			t.Errorf("FilePath(%q) = %q, outside the torrent folder", ok, p)
-		}
-	}
-	for _, bad := range []string{"", "../x", "/etc/passwd", "a/../../x", ".."} {
-		if _, err := s.FilePath(ih, bad); !errors.Is(err, ErrBadPath) {
-			t.Errorf("FilePath(%q) err = %v, want ErrBadPath", bad, err)
-		}
-	}
-	if _, err := s.FilePath("../"+strings.Repeat("a", 37), "file"); !errors.Is(err, ErrBadPath) {
-		t.Errorf("accepted an invalid info hash")
-	}
-}
-
-func TestPublishAndRemove(t *testing.T) {
+func newStore(t *testing.T) Store {
+	t.Helper()
 	s := New(t.TempDir())
 	if err := s.EnsureDirs(); err != nil {
 		t.Fatal(err)
 	}
-	ih := strings.Repeat("b", 40)
-	src := filepath.Join(s.IncomingDir(ih), "Folder", "file.bin")
-	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(src, []byte("hello"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	return s
+}
 
-	if err := s.Publish(ih); err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	p, err := s.FilePath(ih, "Folder/file.bin")
-	if err != nil {
+func write(t *testing.T, p, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if b, err := os.ReadFile(p); err != nil || string(b) != "hello" {
-		t.Fatalf("published file: %q, %v", b, err)
-	}
-	if _, err := os.Stat(s.IncomingDir(ih)); !os.IsNotExist(err) {
-		t.Fatalf("incoming folder still exists after Publish (err=%v)", err)
-	}
-
-	if err := s.Remove(ih); err != nil {
-		t.Fatalf("Remove: %v", err)
-	}
-	if _, err := os.Stat(s.TorrentDir(ih)); !os.IsNotExist(err) {
-		t.Fatalf("torrent folder still exists after Remove (err=%v)", err)
-	}
-	if err := s.Remove(ih); err != nil {
-		t.Fatalf("Remove of a missing torrent should succeed: %v", err)
-	}
-	if err := s.Publish("not-a-hash"); !errors.Is(err, ErrBadPath) {
-		t.Fatalf("Publish(invalid hash) err = %v", err)
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestFreeBytes(t *testing.T) {
-	n, err := New(t.TempDir()).FreeBytes()
+func TestPublishOpenRemove(t *testing.T) {
+	s := newStore(t)
+	src := s.IncomingDir(7)
+	write(t, filepath.Join(src, "Movie", "movie.mkv"), "video")
+	files := []db.ManifestFile{{Path: "Movie/movie.mkv", SizeBytes: 5}}
+	if err := CheckManifest(src, files); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Publish(src, 7); err != nil {
+		t.Fatal(err)
+	}
+	// A second publish after a restart finds the move done.
+	if err := s.Publish(src, 7); err != nil {
+		t.Fatalf("publish again: %v", err)
+	}
+	f, err := s.Open(7, "Movie/movie.mkv")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n <= 0 {
-		t.Fatalf("FreeBytes = %d, want > 0", n)
+	f.Close()
+	if err := s.Remove(7); err != nil {
+		t.Fatal(err)
+	}
+	if s.Published(7) {
+		t.Fatal("store/7 still exists after Remove")
+	}
+}
+
+func TestOpenRefusesEscapes(t *testing.T) {
+	s := newStore(t)
+	write(t, filepath.Join(s.ItemDir(1), "ok.txt"), "x")
+	write(t, filepath.Join(s.Root, "secret.txt"), "secret")
+	if err := os.Symlink(filepath.Join(s.Root, "secret.txt"), filepath.Join(s.ItemDir(1), "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"", "../x", "/etc/passwd", "a/../../x", "..", "link.txt"} {
+		if f, err := s.Open(1, bad); err == nil {
+			f.Close()
+			t.Errorf("Open(%q) succeeded", bad)
+		}
+	}
+}
+
+func TestCheckManifestRefusesLinksAndEscapes(t *testing.T) {
+	s := newStore(t)
+	src := s.IncomingDir(2)
+	write(t, filepath.Join(src, "a.txt"), "a")
+	if err := os.Symlink("/etc/hosts", filepath.Join(src, "l.txt")); err != nil {
+		t.Fatal(err)
+	}
+	for _, files := range [][]db.ManifestFile{
+		{{Path: "l.txt"}}, {{Path: "../x"}}, {{Path: "missing.txt"}}, nil,
+	} {
+		if err := CheckManifest(src, files); err == nil {
+			t.Errorf("CheckManifest(%v) accepted", files)
+		}
+	}
+	if err := s.Publish(filepath.Join(s.Root, "store", "9"), 3); !errors.Is(err, ErrBadPath) {
+		t.Errorf("Publish from outside incoming/: %v", err)
+	}
+}
+
+func TestSweepAndAdoptLegacy(t *testing.T) {
+	s := newStore(t)
+	hash := strings.Repeat("c", 40)
+	write(t, filepath.Join(s.Root, "store", hash, "f"), "x")
+	if err := s.AdoptLegacy(5, hash); err != nil || !s.Published(5) {
+		t.Fatalf("adopt: %v", err)
+	}
+	write(t, filepath.Join(s.IncomingDir(8), "f"), "x")
+	write(t, filepath.Join(s.ItemDir(9), "f"), "x")
+	write(t, filepath.Join(s.Root, "store", "notes", "f"), "x")
+	removed, err := s.Sweep(map[int64]bool{5: true}, time.Hour, time.Now().Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 2 || !s.Published(5) || !Exists(filepath.Join(s.Root, "store", "notes")) {
+		t.Fatalf("removed %v", removed)
+	}
+	// Folders younger than minAge stay.
+	write(t, filepath.Join(s.IncomingDir(10), "f"), "x")
+	if removed, _ := s.Sweep(nil, time.Hour, time.Now()); len(removed) != 0 {
+		t.Fatalf("swept a new folder: %v", removed)
 	}
 }

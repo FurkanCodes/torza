@@ -2,290 +2,241 @@ package ingest
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
-	"strings"
+	"sync"
 	"testing"
-	"time"
 
 	"torza/internal/db"
-	"torza/internal/magnet"
-	"torza/internal/qbit"
+	"torza/internal/dbtest"
+	"torza/internal/source"
 	"torza/internal/store"
 )
 
-var testNow = time.Unix(1_700_000_000, 0)
-
-// fakeRepo keeps torrents in memory and applies the same status rules as the
-// real queries.
-type fakeRepo struct {
-	torrents map[string]*db.Torrent
-	files    map[string][]db.FileInput
-	purged   map[string]bool
+// fakeSource is a two-step fetcher: Start writes the files at once, and the
+// test says when Poll reports them done. Its only state outside the test's
+// control is the files on disk, like a real source after a restart.
+type fakeSource struct {
+	mu        sync.Mutex
+	files     map[string]string // what Start writes, by path
+	size      int64             // what Poll reports as the total
+	done      bool
+	cancelled []int64
+	released  []int64
+	symlink   bool // write a symbolic link instead of a file
 }
 
-func (r *fakeRepo) TorrentsByStatus(_ context.Context, statuses ...string) ([]db.Torrent, error) {
-	var out []db.Torrent
-	for _, t := range r.torrents {
-		if slices.Contains(statuses, t.Status) {
-			out = append(out, *t)
+func (f *fakeSource) Name() string { return "qbittorrent" }
+
+func (f *fakeSource) Start(_ context.Context, j source.Job) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for p, body := range f.files {
+		full := filepath.Join(j.Dir, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return nil, err
+		}
+		if f.symlink {
+			if err := os.Symlink("/etc/hosts", full); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			return nil, err
 		}
 	}
-	slices.SortFunc(out, func(a, b db.Torrent) int { return strings.Compare(a.InfoHash, b.InfoHash) })
-	return out, nil
+	return []byte(`{"dir":"` + j.Dir + `"}`), nil
 }
 
-func (r *fakeRepo) BlockedUnpurged(context.Context) ([]db.Torrent, error) {
-	var out []db.Torrent
-	for _, t := range r.torrents {
-		if t.Status == db.StatusBlocked && !r.purged[t.InfoHash] {
-			out = append(out, *t)
-		}
+func (f *fakeSource) Poll(context.Context, source.Job) (source.Report, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return source.Report{Phase: "downloading", Name: "Demo", BytesTotal: f.size, BytesDone: f.size / 2, Done: f.done}, nil
+}
+
+func (f *fakeSource) Finalize(_ context.Context, j source.Job) (source.Manifest, error) {
+	m := source.Manifest{Root: j.Dir, Name: "Demo"}
+	for p, body := range f.files {
+		m.Files = append(m.Files, db.ManifestFile{Path: p, SizeBytes: int64(len(body))})
 	}
-	return out, nil
+	return m, nil
 }
 
-func (r *fakeRepo) MarkDownloading(_ context.Context, ih string) error {
-	if t := r.torrents[ih]; t.Status == db.StatusQueued {
-		t.Status = db.StatusDownloading
+func (f *fakeSource) Root(j source.Job) (string, error) { return j.Dir, nil }
+
+func (f *fakeSource) Release(_ context.Context, j source.Job) error {
+	f.released = append(f.released, j.ItemID)
+	return nil
+}
+
+func (f *fakeSource) Cancel(_ context.Context, j source.Job, deleteData bool) error {
+	f.cancelled = append(f.cancelled, j.ItemID)
+	if deleteData {
+		return os.RemoveAll(j.Dir)
 	}
 	return nil
 }
 
-func (r *fakeRepo) UpdateProgress(_ context.Context, ih, name string, size int64, progress float64) error {
-	if t := r.torrents[ih]; t.Status == db.StatusDownloading {
-		t.Name, t.SizeBytes, t.Progress = name, size, progress
-	}
-	return nil
+type rig struct {
+	repo *db.Repo
+	src  *fakeSource
+	st   store.Store
+	w    *Worker
+	user db.User
 }
 
-func (r *fakeRepo) MarkReady(_ context.Context, ih, name string, size int64, files []db.FileInput) error {
-	t := r.torrents[ih]
-	if t.Status != db.StatusDownloading {
-		return db.ErrConflict
-	}
-	t.Status, t.Name, t.SizeBytes, t.Progress = db.StatusReady, name, size, 1
-	r.files[ih] = files
-	return nil
-}
-
-func (r *fakeRepo) MarkFailed(_ context.Context, ih, reason string) error {
-	if t := r.torrents[ih]; t.Status == db.StatusQueued || t.Status == db.StatusDownloading {
-		t.Status, t.Error = db.StatusFailed, reason
-	}
-	return nil
-}
-
-func (r *fakeRepo) MarkPurged(_ context.Context, ih string) error {
-	r.purged[ih] = true
-	return nil
-}
-
-// fakeEngine imitates qBittorrent.
-type fakeEngine struct {
-	torrents  map[string]qbit.Torrent
-	files     map[string][]qbit.File
-	added     []string
-	savePaths map[string]string
-	deleted   map[string]bool // info hash → deleteFiles
-}
-
-func (e *fakeEngine) Add(_ context.Context, uri, savePath string) error {
-	m, err := magnet.Parse(uri)
-	if err != nil {
-		return err
-	}
-	e.added = append(e.added, m.InfoHash)
-	e.savePaths[m.InfoHash] = savePath
-	if _, ok := e.torrents[m.InfoHash]; !ok {
-		e.torrents[m.InfoHash] = qbit.Torrent{Hash: m.InfoHash, State: "metaDL", AddedOn: testNow.Unix()}
-	}
-	return nil
-}
-
-func (e *fakeEngine) Info(_ context.Context, hashes []string) ([]qbit.Torrent, error) {
-	var out []qbit.Torrent
-	for _, h := range hashes {
-		if t, ok := e.torrents[h]; ok {
-			out = append(out, t)
-		}
-	}
-	return out, nil
-}
-
-func (e *fakeEngine) Files(_ context.Context, h string) ([]qbit.File, error) { return e.files[h], nil }
-
-func (e *fakeEngine) Delete(_ context.Context, hashes []string, deleteFiles bool) error {
-	for _, h := range hashes {
-		delete(e.torrents, h)
-		e.deleted[h] = deleteFiles
-	}
-	return nil
-}
-
-func setup(t *testing.T, status string) (*Worker, *fakeRepo, *fakeEngine, store.Store, string) {
+func newRig(t *testing.T) *rig {
 	t.Helper()
+	repo := dbtest.Repo(t)
 	st := store.New(t.TempDir())
 	if err := st.EnsureDirs(); err != nil {
 		t.Fatal(err)
 	}
-	ih := strings.Repeat("a", 40)
-	repo := &fakeRepo{
-		torrents: map[string]*db.Torrent{ih: {InfoHash: ih, Magnet: "magnet:?xt=urn:btih:" + ih, Status: status}},
-		files:    map[string][]db.FileInput{},
-		purged:   map[string]bool{},
+	src := &fakeSource{files: map[string]string{"Demo/demo.mkv": "video", "Demo/demo.srt": "subs"}, size: 10}
+	u, err := repo.CreateUser(context.Background(), "u@example.test", false, []byte("k"), "p")
+	if err != nil {
+		t.Fatal(err)
 	}
-	eng := &fakeEngine{torrents: map[string]qbit.Torrent{}, files: map[string][]qbit.File{}, savePaths: map[string]string{}, deleted: map[string]bool{}}
-	w := New(repo, eng, st, Config{MaxTorrentBytes: 1000, MetadataTimeout: time.Hour}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	w.now = func() time.Time { return testNow }
-	return w, repo, eng, st, ih
+	w := New(repo, src, st, Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return &rig{repo: repo, src: src, st: st, w: w, user: u}
 }
 
-func tick(t *testing.T, w *Worker) {
+func (r *rig) add(t *testing.T, n int) db.AddResult {
 	t.Helper()
-	if err := w.Tick(context.Background()); err != nil {
-		t.Fatalf("Tick: %v", err)
-	}
-}
-
-func TestDownloadLifecycle(t *testing.T) {
-	w, repo, eng, st, ih := setup(t, db.StatusQueued)
-
-	// 1. Queued: handed to qBittorrent with its own save folder.
-	tick(t, w)
-	if got := repo.torrents[ih].Status; got != db.StatusDownloading {
-		t.Fatalf("status = %s, want downloading", got)
-	}
-	if len(eng.added) != 1 || eng.savePaths[ih] != st.IncomingDir(ih) {
-		t.Fatalf("added %v to %q", eng.added, eng.savePaths[ih])
-	}
-	if _, err := os.Stat(st.IncomingDir(ih)); err != nil {
-		t.Fatalf("save folder wasn't created: %v", err)
-	}
-
-	// 2. Downloading: progress is recorded.
-	eng.torrents[ih] = qbit.Torrent{Hash: ih, Name: "Movie", State: "downloading", Progress: 0.5, TotalSize: 100, AddedOn: testNow.Unix()}
-	tick(t, w)
-	if tr := repo.torrents[ih]; tr.Progress != 0.5 || tr.SizeBytes != 100 || tr.Name != "Movie" {
-		t.Fatalf("progress not recorded: %+v", tr)
-	}
-
-	// 3. Finished: moved into the cache, file list recorded, removed from qBittorrent.
-	src := filepath.Join(st.IncomingDir(ih), "Movie", "movie.mkv")
-	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+	k := db.Key{Kind: db.KindTorrent, Value: fmt.Sprintf("%040x", n)}
+	res, err := r.repo.Add(context.Background(), r.user.ID, k, "magnet:?xt=urn:btih:"+k.Value, "", "qbittorrent", db.Limits{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(src, []byte("data"), 0o644); err != nil {
+	return res
+}
+
+func (r *rig) tick(t *testing.T) {
+	t.Helper()
+	if err := r.w.Tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	eng.torrents[ih] = qbit.Torrent{Hash: ih, Name: "Movie", State: "stalledUP", Progress: 1, TotalSize: 100, AddedOn: testNow.Unix()}
-	eng.files[ih] = []qbit.File{{Name: "Movie/movie.mkv", Size: 100, Progress: 1}}
-	tick(t, w)
+}
 
-	if got := repo.torrents[ih].Status; got != db.StatusReady {
-		t.Fatalf("status = %s, want ready", got)
+func (r *rig) item(t *testing.T, id int64) (db.Item, []db.File) {
+	t.Helper()
+	it, files, err := r.repo.LibraryItem(context.Background(), r.user.ID, id)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if deleteFiles, ok := eng.deleted[ih]; !ok || deleteFiles {
-		t.Fatalf("want removed from qBittorrent keeping files; removed=%v deleteFiles=%v", ok, deleteFiles)
+	return it, files
+}
+
+func TestDownloadBecomesReady(t *testing.T) {
+	r := newRig(t)
+	res := r.add(t, 1)
+	r.tick(t)
+	if it, _ := r.item(t, res.Item.ID); it.Status != db.StatusActive || it.Progress != .5 {
+		t.Fatalf("after first tick: %q %.2f", it.Status, it.Progress)
 	}
-	p, _ := st.FilePath(ih, "Movie/movie.mkv")
-	if _, err := os.Stat(p); err != nil {
-		t.Fatalf("file isn't in the cache: %v", err)
+	r.src.done = true
+	r.tick(t)
+	it, files := r.item(t, res.Item.ID)
+	if it.Status != db.StatusReady || len(files) != 2 || it.SizeBytes != 9 {
+		t.Fatalf("status %q, %d files, %d bytes", it.Status, len(files), it.SizeBytes)
 	}
-	if got := repo.files[ih]; len(got) != 1 || got[0].Path != "Movie/movie.mkv" || got[0].SizeBytes != 100 {
-		t.Fatalf("files = %+v", got)
+	f, err := r.st.Open(it.ID, "Demo/demo.mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if len(r.src.released) != 1 {
+		t.Fatal("the source wasn't told to release the files")
 	}
 }
 
-func TestStillBusyAtFullProgress(t *testing.T) {
-	w, repo, eng, _, ih := setup(t, db.StatusDownloading)
-	eng.torrents[ih] = qbit.Torrent{Hash: ih, State: "checkingUP", Progress: 1, TotalSize: 100, AddedOn: testNow.Unix()}
-	tick(t, w)
-	if got := repo.torrents[ih].Status; got != db.StatusDownloading {
-		t.Fatalf("finished while qBittorrent was still checking: %s", got)
-	}
-}
-
-func TestFailures(t *testing.T) {
-	cases := []struct {
-		name    string
-		torrent qbit.Torrent
-		files   []qbit.File
-		reason  string
+// A crash after the manifest was stored, at each point of the finish order.
+func TestRecoverFinalizing(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		published bool // the rename into store/ happened
+		vanished  bool // the download folder is gone too
+		want      string
 	}{
-		{
-			name:    "too large",
-			torrent: qbit.Torrent{State: "downloading", Progress: 0.1, TotalSize: 5000, AddedOn: testNow.Unix()},
-			reason:  "limit",
-		},
-		{
-			name:    "no peers",
-			torrent: qbit.Torrent{State: "metaDL", TotalSize: 0, AddedOn: testNow.Add(-2 * time.Hour).Unix()},
-			reason:  "no peers",
-		},
-		{
-			name:    "engine error",
-			torrent: qbit.Torrent{State: "error", TotalSize: 100, AddedOn: testNow.Unix()},
-			reason:  "error",
-		},
-		{
-			name:    "unsafe path",
-			torrent: qbit.Torrent{State: "stalledUP", Progress: 1, TotalSize: 100, AddedOn: testNow.Unix()},
-			files:   []qbit.File{{Name: "../../etc/evil", Size: 100}},
-			reason:  "unsafe",
-		},
-	}
-	for _, c := range cases {
+		{"renamed, not marked ready", true, false, db.StatusReady},
+		{"not renamed yet", false, false, db.StatusReady},
+		{"files gone", false, true, db.StatusQueued},
+	} {
 		t.Run(c.name, func(t *testing.T) {
-			w, repo, eng, _, ih := setup(t, db.StatusDownloading)
-			c.torrent.Hash = ih
-			eng.torrents[ih] = c.torrent
-			eng.files[ih] = c.files
-			tick(t, w)
-			tr := repo.torrents[ih]
-			if tr.Status != db.StatusFailed || !strings.Contains(tr.Error, c.reason) {
-				t.Fatalf("got status %s error %q, want failed with %q", tr.Status, tr.Error, c.reason)
+			r := newRig(t)
+			ctx := context.Background()
+			res := r.add(t, 1)
+			r.tick(t)
+			jobs, err := r.repo.Held(ctx, "qbittorrent", 0)
+			if err != nil || len(jobs) != 1 {
+				t.Fatal(err)
 			}
-			if deleteFiles, ok := eng.deleted[ih]; !ok || !deleteFiles {
-				t.Fatalf("partial files weren't deleted from qBittorrent")
+			m, _ := r.src.Finalize(ctx, r.w.job(jobs[0]))
+			if err := r.repo.BeginFinalize(ctx, res.Item.ID, "qbittorrent", "Demo", m.Files); err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case c.published:
+				if err := r.st.Publish(r.st.IncomingDir(res.Item.ID), res.Item.ID); err != nil {
+					t.Fatal(err)
+				}
+			case c.vanished:
+				_ = os.RemoveAll(r.st.IncomingDir(res.Item.ID))
+			}
+			r.tick(t) // "restart": the next tick recovers from the database and disk
+			it, files := r.item(t, res.Item.ID)
+			if it.Status != c.want && !(c.want == db.StatusQueued && it.Status == db.StatusActive) {
+				t.Fatalf("status %q, want %q", it.Status, c.want)
+			}
+			if c.want == db.StatusReady && (len(files) != 2 || !r.st.Published(it.ID)) {
+				t.Fatalf("%d files, published %v", len(files), r.st.Published(it.ID))
 			}
 		})
 	}
 }
 
-func TestPurgeBlocked(t *testing.T) {
-	w, repo, eng, st, ih := setup(t, db.StatusBlocked)
-	eng.torrents[ih] = qbit.Torrent{Hash: ih, State: "downloading"}
-	if err := os.MkdirAll(st.TorrentDir(ih), 0o755); err != nil {
+func TestBlockedDownloadIsStoppedAndDeleted(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+	res := r.add(t, 1)
+	r.tick(t)
+	k := db.Key{Kind: db.KindTorrent, Value: fmt.Sprintf("%040x", 1)}
+	if _, err := r.repo.Block(ctx, k, "takedown", "", r.user.ID); err != nil {
 		t.Fatal(err)
 	}
-	tick(t, w)
-	if !repo.purged[ih] {
-		t.Fatal("blocked torrent wasn't marked purged")
+	r.src.done = true
+	r.tick(t)
+	if len(r.src.cancelled) != 1 || store.Exists(r.st.IncomingDir(res.Item.ID)) || r.st.Published(res.Item.ID) {
+		t.Fatalf("cancelled %v; incoming exists %v", r.src.cancelled, store.Exists(r.st.IncomingDir(res.Item.ID)))
 	}
-	if deleteFiles, ok := eng.deleted[ih]; !ok || !deleteFiles {
-		t.Fatal("blocked torrent wasn't removed from qBittorrent with its files")
-	}
-	if _, err := os.Stat(st.TorrentDir(ih)); !os.IsNotExist(err) {
-		t.Fatal("blocked torrent's cached files still exist")
-	}
-}
-
-func TestReaddsLostTorrent(t *testing.T) {
-	w, _, eng, _, ih := setup(t, db.StatusDownloading)
-	tick(t, w)
-	if len(eng.added) != 1 || eng.added[0] != ih {
-		t.Fatalf("lost torrent wasn't re-added: %v", eng.added)
+	held, _ := r.repo.BlockedHeld(ctx, "qbittorrent")
+	if len(held) != 0 {
+		t.Fatal("blocked item still has a handle after purge")
 	}
 }
 
-func TestHumanBytes(t *testing.T) {
-	for in, want := range map[int64]string{999: "999 B", 1500: "1.5 kB", 100e9: "100.0 GB", 2_500_000_000_000: "2.5 TB"} {
-		if got := humanBytes(in); got != want {
-			t.Errorf("humanBytes(%d) = %q, want %q", in, got, want)
-		}
+func TestOverSizeLimitFails(t *testing.T) {
+	r := newRig(t)
+	r.w.cfg.MaxItemBytes = 5
+	res := r.add(t, 1)
+	r.tick(t)
+	it, _ := r.item(t, res.Item.ID)
+	if it.Status != db.StatusFailed || it.Error == "" || store.Exists(r.st.IncomingDir(res.Item.ID)) {
+		t.Fatalf("status %q, error %q", it.Status, it.Error)
+	}
+}
+
+func TestUnsafeFilesFail(t *testing.T) {
+	r := newRig(t)
+	r.src.symlink, r.src.done = true, true
+	res := r.add(t, 1)
+	r.tick(t)
+	it, _ := r.item(t, res.Item.ID)
+	if it.Status != db.StatusFailed || r.st.Published(res.Item.ID) {
+		t.Fatalf("status %q, published %v", it.Status, r.st.Published(res.Item.ID))
 	}
 }

@@ -39,9 +39,10 @@
           <label for="magnet">Magnet link or info hash</label>
           <div class="row">
             <input id="magnet" name="magnet" type="text" autocomplete="off" spellcheck="false"
-                   placeholder="magnet:?xt=urn:btih:…" aria-describedby="add-msg">
+                   placeholder="magnet:?xt=urn:btih:…" aria-describedby="avail add-msg">
             <button type="submit" class="btn btn-primary" id="add-submit">Add torrent</button>
           </div>
+          <p class="field-msg avail" id="avail" role="status" aria-live="polite" hidden></p>
           <p class="field-msg" id="add-msg" role="status" hidden></p>
         </form>
       </section>

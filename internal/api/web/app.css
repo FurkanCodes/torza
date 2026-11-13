@@ -97,7 +97,7 @@ input[aria-invalid=true] { border-color: var(--danger); }
 
 .status { display: inline-block; font-size: 0.8125rem; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); color: var(--text-2); }
 .status.ready { background: var(--success-soft); color: var(--success); }
-.status.downloading { background: var(--accent-soft); color: var(--accent); }
+.status.active, .status.finalizing { background: var(--accent-soft); color: var(--accent); }
 .status.failed, .status.blocked { background: var(--danger-soft); color: var(--danger); }
 .status.evicted { background: var(--warning-soft); color: var(--warning); }
 

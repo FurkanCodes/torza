@@ -1,5 +1,6 @@
-// Command scheduler evicts least recently used torrents when the cache is too
-// big or the disk is too full.
+// Command scheduler does housekeeping: it evicts least recently used items
+// when the cache is too big or the disk too full, deletes blocked items'
+// files, and sweeps folders no item owns.
 package main
 
 import (

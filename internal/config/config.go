@@ -15,7 +15,6 @@ import (
 // Config holds every setting. Each service only uses the parts it needs.
 type Config struct {
 	DatabaseURL string
-	NATSURL     string
 	DataDir     string // holds incoming/ (downloading) and store/ (the cache)
 	PublicURL   string // base URL users reach the stream service at
 	SigningKey  []byte // secret used to sign download links
@@ -29,12 +28,13 @@ type Config struct {
 
 	LinkTTL          time.Duration // how long a download link keeps working
 	MaxActivePerUser int           // downloads one user can have running at once (0 = no limit)
-	MaxTorrentBytes  int64         // biggest torrent we'll download (0 = no limit)
+	MaxTorrentBytes  int64         // biggest item a user may download, unless the owner set their own limit (0 = no limit)
 	MetadataTimeout  time.Duration // give up if no peer sends the file list in time
-	PollInterval     time.Duration // how often ingest checks qBittorrent
+	PollInterval     time.Duration // how often ingest checks its fetcher
+	Fetchers         []string      // which fetchers this ingest container runs
 
 	EvictInterval     time.Duration // how often the scheduler checks disk space
-	EvictIdleFor      time.Duration // never evict anything used more recently than this
+	EvictIdleFor      time.Duration // never evict anything used more recently than this (protects what someone is watching)
 	CacheMaxBytes     int64         // evict when the cache grows past this (0 = no limit)
 	CacheMinFreeBytes int64         // evict when free disk space drops below this (0 = no limit)
 }
@@ -44,7 +44,6 @@ func Load() (Config, error) {
 	var p parser
 	c := Config{
 		DatabaseURL: p.str("DATABASE_URL", "postgres://torza:torza@postgres:5432/torza?sslmode=disable"),
-		NATSURL:     p.str("NATS_URL", "nats://nats:4222"),
 		DataDir:     p.str("DATA_DIR", "/data"),
 		PublicURL:   strings.TrimRight(p.str("PUBLIC_URL", "http://localhost:8081"), "/"),
 		APIAddr:     p.str("API_ADDR", ":8080"),
@@ -58,9 +57,10 @@ func Load() (Config, error) {
 		MaxTorrentBytes:  p.bytes("MAX_TORRENT_BYTES", 100e9),
 		MetadataTimeout:  p.duration("METADATA_TIMEOUT", 2*time.Hour),
 		PollInterval:     p.duration("POLL_INTERVAL", 5*time.Second),
+		Fetchers:         strings.Split(p.str("INGEST_FETCHERS", "qbittorrent"), ","),
 
 		EvictInterval:     p.duration("EVICT_INTERVAL", 10*time.Minute),
-		EvictIdleFor:      p.duration("EVICT_IDLE_FOR", 15*time.Minute),
+		EvictIdleFor:      p.duration("EVICT_IDLE_FOR", 6*time.Hour),
 		CacheMaxBytes:     p.bytes("CACHE_MAX_BYTES", 0),
 		CacheMinFreeBytes: p.bytes("CACHE_MIN_FREE_BYTES", 20e9),
 	}
