@@ -71,6 +71,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /v1/torrents/{infohash}", s.withUser(s.removeTorrent))
 	mux.Handle("POST /v1/files/{id}/link", s.withUser(s.createLink))
 	mux.Handle("POST /v1/admin/blocklist", s.withUser(adminOnly(s.blockTorrent)))
+	web := s.webHandler()
+	mux.Handle("GET /{$}", web)
+	mux.Handle("GET /ui/", web)
 	return mux
 }
 

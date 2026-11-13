@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Torza</title>
+<link rel="stylesheet" href="/ui/app.css">
+<script src="/ui/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1 class="brand">Torza</h1>
+  <p class="who" id="who" hidden></p>
+  <button type="button" class="btn btn-plain" id="change-key" hidden>Change API key</button>
+</header>
+
+<div class="banner" id="banner" role="alert" hidden></div>
+
+<main>
+  <!-- Shown until a working API key is saved. -->
+  <section class="card gate" id="gate" hidden aria-labelledby="gate-title">
+    <h2 id="gate-title">Connect with your API key</h2>
+    <p class="muted">It's in <code>deploy/.local-api-key</code>. It stays in this browser only.</p>
+    <form id="key-form" novalidate>
+      <label for="key">API key</label>
+      <div class="row">
+        <input id="key" name="key" type="password" autocomplete="off" spellcheck="false" required>
+        <button type="submit" class="btn btn-primary" id="key-submit">Connect</button>
+      </div>
+      <p class="field-error" id="key-error" role="alert" hidden></p>
+    </form>
+  </section>
+
+  <div class="layout" id="app" hidden>
+    <div class="col">
+      <section aria-labelledby="add-title">
+        <h2 id="add-title">Add a torrent</h2>
+        <form id="add-form" novalidate>
+          <label for="magnet">Magnet link or info hash</label>
+          <div class="row">
+            <input id="magnet" name="magnet" type="text" autocomplete="off" spellcheck="false"
+                   placeholder="magnet:?xt=urn:btih:…" aria-describedby="add-msg">
+            <button type="submit" class="btn btn-primary" id="add-submit">Add torrent</button>
+          </div>
+          <p class="field-msg" id="add-msg" role="status" hidden></p>
+        </form>
+      </section>
+
+      <section aria-labelledby="lib-title">
+        <div class="section-head">
+          <h2 id="lib-title">Library</h2>
+          <span class="muted small" id="lib-updated" aria-live="off"></span>
+        </div>
+        <ul class="library" id="library" aria-busy="true"></ul>
+      </section>
+    </div>
+
+    <aside class="col player-col" aria-labelledby="player-title">
+      <div class="player card" id="player">
+        <h2 id="player-title">Player</h2>
+        <p class="muted" id="player-empty">Pick a video file in your library to play it here.</p>
+        <div id="player-body" hidden>
+          <p class="now-playing" id="now-playing"></p>
+          <video id="video" controls preload="metadata" playsinline></video>
+          <p class="field-error" id="player-error" role="alert" hidden></p>
+          <div class="row actions">
+            <button type="button" class="btn btn-secondary" id="copy-link">Copy link for VLC</button>
+            <span class="muted small" id="copy-msg" role="status"></span>
+          </div>
+          <p class="muted small">The link works for 6 hours. Browsers can't play every format; if this one won't play, copy the link into VLC.</p>
+        </div>
+      </div>
+    </aside>
+  </div>
+</main>
+
+<div class="toast" id="toast" role="status" hidden>
+  <span id="toast-text"></span>
+  <button type="button" class="btn btn-plain" id="toast-undo">Undo</button>
+</div>
+</body>
+</html>
