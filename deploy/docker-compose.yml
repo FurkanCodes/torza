@@ -8,7 +8,7 @@ x-torza-env: &torza-env
   DATA_DIR: /data
   PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
   SIGNING_KEY: ${SIGNING_KEY:?set SIGNING_KEY in .env}
-  QBIT_URL: http://qbittorrent:8080
+  QBIT_URL: http://qbittorrent:8090
   QBIT_USER: ${QBIT_USER:-admin}
   QBIT_PASS: ${QBIT_PASS:-}
   LINK_TTL: ${LINK_TTL:-6h}
@@ -48,13 +48,15 @@ services:
       PUID: "1000"
       PGID: "1000"
       TZ: Etc/UTC
-      WEBUI_PORT: "8080"
+      # Same port inside and outside: qBittorrent rejects requests whose Host
+      # header port differs from its own.
+      WEBUI_PORT: "8090"
       TORRENTING_PORT: "6881"
     ports:
       - "6881:6881"
       - "6881:6881/udp"
       # Web UI, reachable only from the server itself (use an SSH tunnel).
-      - "127.0.0.1:8090:8080"
+      - "127.0.0.1:8090:8090"
     volumes:
       - qbit_config:/config
       # Must be the same path (/data) as in ingest: Torza tells qBittorrent

@@ -1,3 +1,7 @@
 deploy/.env
 deploy/data/
 /bin/
+deploy/.env.local
+deploy/data-local/
+deploy/.local-api-key
+deploy/.local-last-link

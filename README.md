@@ -65,6 +65,29 @@ Error codes worth knowing: `429` means you have too many downloads running,
 `451` means the torrent was removed after a takedown, and `410` from a download
 link means it expired (create a new one).
 
+## Running locally (Mac)
+
+Needs Docker Desktop. Everything runs in containers; nothing is installed on
+the Mac itself.
+
+```sh
+deploy/local.sh up                      # build the image and start everything
+deploy/local.sh user you@example.com -admin   # prints your API key once
+deploy/local.sh logs ingest             # or api, stream, scheduler, qbittorrent
+deploy/local.sh down                    # stop (downloads and the database are kept)
+```
+
+The first `up` creates `deploy/.env.local` with fresh secrets. qBittorrent
+prints a temporary Web UI password on its first start
+(`deploy/local.sh logs qbittorrent`); log in at http://localhost:8090, set a
+permanent password, put it in `deploy/.env.local` as `QBIT_PASS`, and turn
+off torrent queueing. Then `deploy/local.sh up` again.
+
+The API is at http://localhost:8080 and download links point at
+http://localhost:8081, both reachable from this Mac only. Open a link in
+VLC, IINA or QuickTime to stream it. Downloads use your home connection, so
+test with legal torrents such as Linux ISOs or Creative Commons films.
+
 ## Deploying (first time)
 
 These steps haven't been run yet. Check each one on the first deploy.
