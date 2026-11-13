@@ -1,0 +1,106 @@
+# Torza on one server. Run from this folder: docker compose up -d --build
+# Settings come from .env next to this file (copy .env.example).
+name: torza
+
+x-torza-env: &torza-env
+  DATABASE_URL: postgres://torza:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/torza?sslmode=disable
+  NATS_URL: nats://nats:4222
+  DATA_DIR: /data
+  PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
+  SIGNING_KEY: ${SIGNING_KEY:?set SIGNING_KEY in .env}
+  QBIT_URL: http://qbittorrent:8080
+  QBIT_USER: ${QBIT_USER:-admin}
+  QBIT_PASS: ${QBIT_PASS:-}
+  LINK_TTL: ${LINK_TTL:-6h}
+  MAX_ACTIVE_PER_USER: ${MAX_ACTIVE_PER_USER:-3}
+  MAX_TORRENT_BYTES: ${MAX_TORRENT_BYTES:-100GB}
+  CACHE_MAX_BYTES: ${CACHE_MAX_BYTES:-0}
+  CACHE_MIN_FREE_BYTES: ${CACHE_MIN_FREE_BYTES:-20GB}
+
+x-torza: &torza
+  image: torza:local
+  build:
+    context: ..
+  restart: unless-stopped
+  environment: *torza-env
+  depends_on: [postgres, nats]
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: torza
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: torza
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  nats:
+    image: nats:2
+    restart: unless-stopped
+
+  qbittorrent:
+    # Pin to a specific version tag after the first successful deploy.
+    image: lscr.io/linuxserver/qbittorrent:latest
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Etc/UTC
+      WEBUI_PORT: "8080"
+      TORRENTING_PORT: "6881"
+    ports:
+      - "6881:6881"
+      - "6881:6881/udp"
+      # Web UI, reachable only from the server itself (use an SSH tunnel).
+      - "127.0.0.1:8090:8080"
+    volumes:
+      - qbit_config:/config
+      # Must be the same path (/data) as in ingest: Torza tells qBittorrent
+      # where to save each torrent.
+      - ${DATA_PATH:-./data}:/data
+
+  api:
+    <<: *torza
+    command: ["api"]
+
+  stream:
+    <<: *torza
+    command: ["stream"]
+    volumes:
+      - ${DATA_PATH:-./data}:/data:ro
+
+  ingest:
+    <<: *torza
+    command: ["ingest"]
+    depends_on: [postgres, nats, qbittorrent]
+    volumes:
+      - ${DATA_PATH:-./data}:/data
+
+  scheduler:
+    <<: *torza
+    command: ["scheduler"]
+    volumes:
+      - ${DATA_PATH:-./data}:/data
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api, stream]
+
+volumes:
+  pgdata:
+  qbit_config:
+  caddy_data:
+  caddy_config:
