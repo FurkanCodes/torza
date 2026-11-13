@@ -52,6 +52,17 @@ func (r *Repo) AddTorrentForUser(ctx context.Context, userID int64, m magnet.Mag
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // does nothing once committed
 
+	// Serialise adds by this user (so parallel adds can't pass the active
+	// limit together) and adds and takedowns of this torrent (so two users
+	// adding it at once start one download, and a block can't be lost). The
+	// locks end with the transaction; user first, then torrent, always.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, ($2::bigint % 2147483647)::int)`, lockClassUser, userID); err != nil {
+		return Torrent{}, false, err
+	}
+	if err := lockTorrent(ctx, tx, m.InfoHash); err != nil {
+		return Torrent{}, false, err
+	}
+
 	var blocked bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM blocklist WHERE infohash = $1)`, m.InfoHash).Scan(&blocked); err != nil {
 		return Torrent{}, false, err
@@ -325,6 +336,9 @@ func (r *Repo) Block(ctx context.Context, infohash, reason, reference string) er
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockTorrent(ctx, tx, infohash); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO blocklist (infohash, reason, reference) VALUES ($1, $2, $3)
 		ON CONFLICT (infohash) DO UPDATE SET reason = EXCLUDED.reason, reference = EXCLUDED.reference`,
@@ -338,6 +352,19 @@ func (r *Repo) Block(ctx context.Context, infohash, reason, reference string) er
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+// Advisory lock classes, the first half of each two-number lock key.
+const (
+	lockClassUser    = 1
+	lockClassTorrent = 2
+)
+
+// lockTorrent holds a transaction lock on one info hash until the
+// transaction ends.
+func lockTorrent(ctx context.Context, tx pgx.Tx, infohash string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2))`, lockClassTorrent, infohash)
+	return err
+}
 
 var torrentFields = []string{
 	"infohash", "name", "magnet", "status", "size_bytes", "progress", "error",
