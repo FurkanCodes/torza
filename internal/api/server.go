@@ -22,6 +22,7 @@ import (
 	"torza/internal/db"
 	"torza/internal/magnet"
 	"torza/internal/service"
+	"torza/internal/stremio"
 )
 
 // MaxCheck is the most inputs one availability check takes.
@@ -57,6 +58,12 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/files/{id}/link", s.withUser(s.fileLink))
 	mux.Handle("POST /v1/admin/blocklist", s.withUser(adminOnly(s.block)))
 	mux.Handle("PUT /v1/admin/users/{id}/limits", s.withUser(adminOnly(s.setLimits)))
+	mux.Handle("POST /v1/stremio", s.withUser(s.newStremio))
+	mux.Handle("GET /v1/stremio", s.withUser(s.listStremio))
+	mux.Handle("DELETE /v1/stremio/{id}", s.withUser(s.revokeStremio))
+	if s.svc != nil {
+		stremio.New(s.svc, s.log).Register(mux)
+	}
 	web := s.webHandler()
 	mux.Handle("GET /{$}", web)
 	mux.Handle("GET /ui/", web)
@@ -408,6 +415,72 @@ func (s *Server) setLimits(w http.ResponseWriter, r *http.Request, _ db.User) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ── Stremio add-on links ────────────────────────────────────────────────────
+
+// newStremio: POST /v1/stremio {"label": "Living room TV"} → the add-on's
+// install URLs. The secret in them is shown once.
+func (s *Server) newStremio(w http.ResponseWriter, r *http.Request, u db.User) {
+	var req struct {
+		Label string `json:"label"`
+	}
+	if r.ContentLength != 0 {
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, `body must be empty or JSON like {"label": "Living room TV"}`)
+			return
+		}
+	}
+	if len(req.Label) > 100 {
+		writeError(w, http.StatusBadRequest, "label is too long (100 characters at most)")
+		return
+	}
+	key, c, err := s.svc.NewStremioKey(r.Context(), u.ID, strings.TrimSpace(req.Label))
+	if err != nil {
+		s.internalError(w, "new stremio key", err)
+		return
+	}
+	manifest := requestBase(r) + "/stremio/" + key + "/manifest.json"
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":           c.ID,
+		"label":        c.Label,
+		"manifest_url": manifest,
+		// Opening this link on a device with Stremio installs the add-on.
+		"install_url": "stremio://" + strings.TrimPrefix(strings.TrimPrefix(manifest, "https://"), "http://"),
+	})
+}
+
+func (s *Server) listStremio(w http.ResponseWriter, r *http.Request, u db.User) {
+	cs, err := s.svc.StremioKeys(r.Context(), u.ID)
+	if err != nil {
+		s.internalError(w, "list stremio keys", err)
+		return
+	}
+	out := make([]map[string]any, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, map[string]any{"id": c.ID, "label": c.Label, "prefix": c.Prefix, "created_at": c.CreatedAt, "last_used_at": c.LastUsedAt})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"addons": out})
+}
+
+func (s *Server) revokeStremio(w http.ResponseWriter, r *http.Request, u db.User) {
+	id, ok := idParam(w, r)
+	if !ok {
+		return
+	}
+	if s.libraryError(w, s.svc.RevokeStremioKey(r.Context(), u.ID, id), "revoke stremio key") {
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// requestBase is where this request reached the API.
+func requestBase(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

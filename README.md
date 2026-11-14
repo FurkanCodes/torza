@@ -65,6 +65,9 @@ All `/v1` requests need `Authorization: Bearer <api key>`.
 | `POST` | `/v1/items/{id}/links` | Signed links for every file of a ready item |
 | `POST` | `/v1/files/{id}/link` | A signed link for one file: `{"url": ..., "expires_at": ...}` |
 | `POST` | `/v1/admin/blocklist` | Owner: takedown. `{"torrent": "<magnet or hash>", "reason": "...", "reference": "..."}` |
+| `POST` | `/v1/stremio` | Make a Stremio add-on link for one device: `{"label": "Living room TV"}` → `manifest_url` and a `stremio://` `install_url` (shown once) |
+| `GET` | `/v1/stremio` | Your add-on links |
+| `DELETE` | `/v1/stremio/{id}` | Remove one; Stremio on that device stops seeing your library |
 | `PUT` | `/v1/admin/users/{id}/limits` | Owner: `{"max_active": 3, "max_item_bytes": 50000000000, "priority": 0}`; `null` = server default |
 
 Example:
@@ -81,6 +84,20 @@ been evicted and is downloading again (ask again when it's ready); `429`
 means you have as many downloads running as your limit allows; `451` means
 the content was removed after a takedown; `410` from a download link means it
 expired (make a new one).
+
+## Stremio
+
+Torza is a Stremio add-on for your own library: what you added shows up in
+Stremio under Discover → Torza library, and plays from the cache. Items with
+several video files show as a series, one episode per file. Something that
+was evicted downloads again when you press play; try again a minute later.
+It never searches for content.
+
+Make a link on the web page ("Watch in Stremio") or with `POST /v1/stremio`,
+then open the `stremio://` link or paste the manifest URL into Stremio's
+add-on search. Stremio installs plain-HTTP add-ons only from `127.0.0.1` on
+the same computer, so locally open the page at http://127.0.0.1:8080 to make
+the link; phones and TVs need Torza on HTTPS (the server deploy).
 
 ## Running locally (Mac)
 

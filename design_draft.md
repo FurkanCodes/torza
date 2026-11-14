@@ -1275,22 +1275,50 @@ and two small legal torrents.
     passes the contract suite. Not registered in production until stage 9.
     Also: a fuzz test for the NZB parser and yEnc decoder.
 
-### Stage 4: Stremio library add-on (provisional; each stage gets a short design at its start)
+### Stage 4: Stremio library add-on (built 2026-11-14)
+
+**Short design.** The add-on lists a user's library and plays it from the
+cache; it never searches. It lives in `api` under
+`/stremio/<secret>/…`, authenticated by a `stremio` credential (prefix
+`tzs_`), separate from API keys, one per device, revocable alone.
+
+*   **Types.** An item with one video file is a `movie` (`torza:<item>`);
+    with several, a `series` whose episodes are the files
+    (`torza:<item>:<file>`, season 1, in path order). Files come from
+    `item_files` including `missing` ones, so evicted items keep their
+    shape. Blocked items, and failed items that never had files, are hidden.
+*   **Catalog.** One catalog, `torza-library`, offered for both types; the
+    whole library on the first page, `search` filters by name.
+*   **Streams** point at `/stremio/<secret>/play/<file id>/<name>`, which
+    never expires (Stremio saves URLs). `GET` redirects (302) to a fresh
+    signed `stream` link; for an evicted or failed item it re-queues it as
+    this user (CUJ 2) and answers `503` with `Retry-After: 60`. `HEAD` never
+    re-queues, so probing players don't start downloads. The stream's name
+    and title say whether it is cached, downloading, or not cached.
+*   **URLs** are built from the request's host and `X-Forwarded-Proto`, so
+    the add-on works from 127.0.0.1, the home network or behind Caddy.
+*   **HTTPS.** Stremio installs plain-HTTP add-ons only from 127.0.0.1 on the
+    same computer. Phones and TVs need the server deploy (stage 2) or a
+    tunnel; the web page says so.
 
 #### 47. `internal/stremio/handler.go` and test (Create)
 
 *   **Type / Scope**: Access method inside `api`.
-*   **Proposed Changes**: `/stremio/<credential>/manifest.json`, catalog of
-    the user's library, meta for `torza:<item id>`, streams that point at
-    `/stremio/<credential>/play/<file id>`, which redirects to a fresh
-    signed link or calls `service.Enqueue` for an evicted item. CORS
-    headers. Authenticated by a `stremio` credential.
+*   **Proposed Changes**: manifest, catalog, meta, stream and play routes as
+    above, CORS headers, `no-store` caching. Tests against a real database:
+    manifest and credential separation, catalogs by type, series episodes,
+    streams, play redirect, re-queue on GET but not HEAD, blocked items,
+    revocation.
 
-#### 48. `internal/api/server.go` (Modify)
+#### 48. `internal/db/migrations/0003_stremio.sql` (Create); `internal/api/server.go`, `internal/service/service.go`, `internal/db/repo.go`, `internal/auth/keys.go`, web page (Modify)
 
-*   **Type / Scope**: Routing.
-*   **Proposed Changes**: Mount the Stremio handler; `POST
-    /v1/credentials` to create a Stremio credential.
+*   **Type / Scope**: Schema, credentials and UI.
+*   **Proposed Changes**: Migration 0003 allows credential kind `stremio`
+    and adds `label`. `POST/GET /v1/stremio`, `DELETE /v1/stremio/{id}`
+    (create returns the manifest URL and a `stremio://` install link once);
+    `UserByCredential(kind)`, `CreateCredential`, `Credentials`,
+    `RevokeCredential`, `FilesOf`; `auth.NewStremioKey`; a "Watch in
+    Stremio" section on the web page.
 
 ### Stage 5: HTTP downloader with Real-Debrid and TorBox
 

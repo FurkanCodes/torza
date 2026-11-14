@@ -289,6 +289,14 @@ func (r *Repo) LibraryItem(ctx context.Context, userID, itemID int64) (Item, []F
 	return it, files, err
 }
 
+// FilesOf lists the files of items in a user's library, missing ones too,
+// so an evicted item still shows what it held. Pending files are left out.
+func (r *Repo) FilesOf(ctx context.Context, userID int64, itemIDs []int64) ([]File, error) {
+	return collectFiles(r.pool.Query(ctx, `SELECT f.id, f.item_id, f.path, f.size_bytes, f.state FROM item_files f
+		JOIN user_items ui ON ui.item_id = f.item_id AND ui.user_id = $1
+		WHERE f.item_id = ANY($2) AND f.state <> 'pending' ORDER BY f.item_id, f.path`, userID, itemIDs))
+}
+
 // ItemKeys lists the source keys that lead to an item.
 func (r *Repo) ItemKeys(ctx context.Context, itemID int64) ([]Key, error) {
 	rows, err := r.pool.Query(ctx, `SELECT kind, key FROM item_sources WHERE item_id = $1 ORDER BY kind, key`, itemID)

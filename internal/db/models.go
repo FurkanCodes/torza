@@ -20,6 +20,22 @@ const (
 // Source key kinds.
 const KindTorrent = "torrent"
 
+// Credential kinds.
+const (
+	CredAPI     = "api"
+	CredStremio = "stremio"
+)
+
+// Credential is a key a user holds, without its secret.
+type Credential struct {
+	ID         int64
+	Kind       string
+	Label      string
+	Prefix     string
+	CreatedAt  time.Time
+	LastUsedAt *time.Time
+}
+
 // File states.
 const (
 	FilePresent = "present"

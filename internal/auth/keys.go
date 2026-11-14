@@ -23,6 +23,17 @@ func NewAPIKey() (key string, hash []byte, err error) {
 	return key, HashKey(key), nil
 }
 
+// NewStremioKey returns a new secret for a Stremio add-on URL and its hash.
+// The different prefix shows what a leaked key is for.
+func NewStremioKey() (key string, hash []byte, err error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", nil, err
+	}
+	key = "tzs_" + base64.RawURLEncoding.EncodeToString(b)
+	return key, HashKey(key), nil
+}
+
 // HashKey returns the stored form of a key.
 func HashKey(key string) []byte {
 	sum := sha256.Sum256([]byte(key))

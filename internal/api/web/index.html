@@ -71,6 +71,28 @@
           <p class="muted small">The link works for 6 hours. Browsers can't play every format; if this one won't play, copy the link into VLC.</p>
         </div>
       </div>
+      <section class="card" aria-labelledby="stremio-title">
+        <h2 id="stremio-title">Watch in Stremio</h2>
+        <p class="muted">Your library appears in Stremio under Discover → Torza library. Make one add-on link per device, so you can remove one without the others.</p>
+        <form id="stremio-form" novalidate>
+          <label for="stremio-label">Device name</label>
+          <div class="row">
+            <input id="stremio-label" name="label" type="text" maxlength="100" autocomplete="off" placeholder="Living room TV">
+            <button type="submit" class="btn btn-secondary" id="stremio-create">Make add-on link</button>
+          </div>
+          <p class="field-error" id="stremio-error" role="alert" hidden></p>
+        </form>
+        <div class="addon-new" id="stremio-result" hidden>
+          <p class="addon-warn"><strong>Shown once.</strong> Anyone with this link can watch your library. Remove it below if it leaks.</p>
+          <div class="row actions">
+            <a class="btn btn-primary" id="stremio-install" href="#">Install in Stremio</a>
+            <button type="button" class="btn btn-secondary" id="stremio-copy">Copy add-on URL</button>
+            <span class="muted small" id="stremio-copy-msg" role="status"></span>
+          </div>
+          <p class="muted small" id="stremio-hint">"Install in Stremio" works on the device you're using now. For a TV or phone, copy the URL and paste it in Stremio's add-on search box.</p>
+        </div>
+        <ul class="addons" id="stremio-list" aria-label="Your Stremio add-on links"></ul>
+      </section>
     </aside>
   </div>
 </main>

@@ -42,25 +42,62 @@ func (r *Repo) CreateUser(ctx context.Context, email string, isAdmin bool, keyHa
 	return u, tx.Commit(ctx)
 }
 
-// UserByKeyHash finds the user holding an unrevoked API key, and notes the
-// key was used (at most once a minute, to keep writes down).
+// UserByKeyHash finds the user holding an unrevoked API key.
 func (r *Repo) UserByKeyHash(ctx context.Context, hash []byte) (User, error) {
+	return r.UserByCredential(ctx, CredAPI, hash)
+}
+
+// UserByCredential finds the user holding an unrevoked credential of a kind,
+// and notes it was used (at most once a minute, to keep writes down).
+func (r *Repo) UserByCredential(ctx context.Context, kind string, hash []byte) (User, error) {
 	var u User
 	err := r.pool.QueryRow(ctx, `
 		WITH c AS (
 			UPDATE credentials SET last_used_at = now()
-			WHERE hash = $1 AND kind = 'api' AND revoked_at IS NULL
+			WHERE hash = $1 AND kind = $2 AND revoked_at IS NULL
 			  AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')
 			RETURNING user_id
 		)
 		SELECT u.id, u.email, u.is_admin, u.created_at FROM users u
 		WHERE u.id = COALESCE((SELECT user_id FROM c),
-			(SELECT user_id FROM credentials WHERE hash = $1 AND kind = 'api' AND revoked_at IS NULL))`,
-		hash).Scan(&u.ID, &u.Email, &u.IsAdmin, &u.CreatedAt)
+			(SELECT user_id FROM credentials WHERE hash = $1 AND kind = $2 AND revoked_at IS NULL))`,
+		hash, kind).Scan(&u.ID, &u.Email, &u.IsAdmin, &u.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrNotFound
 	}
 	return u, err
+}
+
+// CreateCredential adds a credential of a kind for a user.
+func (r *Repo) CreateCredential(ctx context.Context, userID int64, kind, label string, hash []byte, prefix string) (Credential, error) {
+	var c Credential
+	err := r.pool.QueryRow(ctx, `INSERT INTO credentials (user_id, kind, label, hash, prefix) VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, kind, label, prefix, created_at, last_used_at`, userID, kind, label, hash, prefix).
+		Scan(&c.ID, &c.Kind, &c.Label, &c.Prefix, &c.CreatedAt, &c.LastUsedAt)
+	return c, err
+}
+
+// Credentials lists a user's unrevoked credentials of a kind.
+func (r *Repo) Credentials(ctx context.Context, userID int64, kind string) ([]Credential, error) {
+	rows, err := r.pool.Query(ctx, `SELECT id, kind, label, prefix, created_at, last_used_at FROM credentials
+		WHERE user_id = $1 AND kind = $2 AND revoked_at IS NULL ORDER BY id`, userID, kind)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Credential, error) {
+		var c Credential
+		return c, row.Scan(&c.ID, &c.Kind, &c.Label, &c.Prefix, &c.CreatedAt, &c.LastUsedAt)
+	})
+}
+
+// RevokeCredential revokes one of a user's credentials of a kind.
+func (r *Repo) RevokeCredential(ctx context.Context, userID, id int64, kind string) error {
+	tag, err := r.pool.Exec(ctx, `UPDATE credentials SET revoked_at = now()
+		WHERE id = $1 AND user_id = $2 AND kind = $3 AND revoked_at IS NULL`, id, userID, kind)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return err
 }
 
 // LimitsFor returns a user's limits, falling back to the defaults for any

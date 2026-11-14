@@ -89,6 +89,8 @@ function showGate(error) {
   $("who").hidden = true;
   $("change-key").hidden = true;
   $("banner").hidden = true;
+  $("stremio-result").hidden = true;
+  addonURL = "";
   $("gate").hidden = false;
   const err = $("key-error");
   err.hidden = !error;
@@ -107,6 +109,7 @@ async function connect() {
     $("change-key").hidden = false;
     renderSkeleton();
     poll();
+    loadAddons();
     return true;
   } catch (e) {
     if (e.status === 401) return false; // api() already showed the gate
@@ -480,6 +483,69 @@ $("toast-undo").addEventListener("click", async () => {
   catch (e) { if (e.status !== 401) showToast("Couldn't add it back: " + e.message, null); }
 });
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("toast").hidden) { $("toast").hidden = true; undo = null; } });
+
+// ── Stremio add-on links ───────────────────────────────────────────────────
+
+let addonURL = "";
+
+async function loadAddons() {
+  try {
+    const r = await api("/v1/stremio");
+    const ul = $("stremio-list");
+    ul.replaceChildren(...(r.addons || []).map(addonRow));
+  } catch (e) { /* the library banner already reports connection problems */ }
+}
+
+function addonRow(a) {
+  const li = el("li", "addon");
+  const label = a.label || "Unnamed device";
+  const name = el("span", "addon-name", label);
+  const used = el("span", "addon-used", a.last_used_at ? "Used " + new Date(a.last_used_at).toLocaleDateString() : "Not used yet");
+  const rm = el("button", "btn btn-danger btn-sm", "Remove");
+  rm.type = "button";
+  rm.setAttribute("aria-label", "Remove the Stremio link for " + label);
+  rm.addEventListener("click", async () => {
+    rm.disabled = true; rm.textContent = "Removing…";
+    try { await api("/v1/stremio/" + a.id, { method: "DELETE" }); li.remove(); showToast("Removed the Stremio link for " + label + ". Stremio on that device stops showing your library.", null); }
+    catch (e) { rm.disabled = false; rm.textContent = "Remove"; if (e.status !== 401) showToast("Couldn't remove it: " + e.message, null); }
+  });
+  li.append(name, used, rm);
+  return li;
+}
+
+$("stremio-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const btn = $("stremio-create");
+  btn.disabled = true; btn.textContent = "Making link…";
+  $("stremio-error").hidden = true;
+  try {
+    const r = await api("/v1/stremio", { method: "POST", body: JSON.stringify({ label: $("stremio-label").value.trim() }) });
+    addonURL = r.manifest_url;
+    $("stremio-install").href = r.install_url;
+    $("stremio-copy-msg").textContent = "";
+    $("stremio-result").hidden = false;
+    // Stremio installs plain-HTTP add-ons only from 127.0.0.1 on the same
+    // computer; any other address needs HTTPS.
+    const local = location.hostname === "127.0.0.1" || location.hostname === "localhost";
+    if (location.protocol !== "https:" && !local) {
+      $("stremio-hint").textContent = "Stremio only installs add-ons over HTTPS, or from 127.0.0.1 on the computer running Torza. On that Mac, open http://127.0.0.1:" + (location.port || "80") + " and make the link there. Phones and TVs need Torza on HTTPS (the server deploy).";
+    } else if (location.protocol !== "https:") {
+      $("stremio-hint").textContent = "This link works in Stremio on this computer. Phones and TVs need Torza on HTTPS (the server deploy).";
+    }
+    $("stremio-label").value = "";
+    $("stremio-install").focus();
+    loadAddons();
+  } catch (e) {
+    if (e.status !== 401) { $("stremio-error").textContent = "Couldn't make a link: " + e.message; $("stremio-error").hidden = false; }
+  } finally {
+    btn.disabled = false; btn.textContent = "Make add-on link";
+  }
+});
+
+$("stremio-copy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(addonURL); $("stremio-copy-msg").textContent = "Copied."; }
+  catch { $("stremio-copy-msg").textContent = "Copy failed. Select it here: " + addonURL; }
+});
 
 // ── Start ──────────────────────────────────────────────────────────────────
 

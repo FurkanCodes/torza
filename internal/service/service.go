@@ -9,6 +9,7 @@ import (
 	"path"
 	"time"
 
+	"torza/internal/auth"
 	"torza/internal/db"
 	"torza/internal/links"
 	"torza/internal/magnet"
@@ -217,4 +218,36 @@ func (s *Service) Block(ctx context.Context, admin db.User, m magnet.Magnet, rea
 // SetLimits sets a user's own limits; nil means the server default.
 func (s *Service) SetLimits(ctx context.Context, userID int64, maxActive *int, maxItemBytes *int64, priority int) error {
 	return s.repo.SetLimits(ctx, userID, maxActive, maxItemBytes, priority)
+}
+
+// ── Stremio add-on credentials ──────────────────────────────────────────────
+
+// NewStremioKey creates an add-on secret for a user. The secret is returned
+// once; Torza keeps only its hash.
+func (s *Service) NewStremioKey(ctx context.Context, userID int64, label string) (string, db.Credential, error) {
+	key, hash, err := auth.NewStremioKey()
+	if err != nil {
+		return "", db.Credential{}, err
+	}
+	c, err := s.repo.CreateCredential(ctx, userID, db.CredStremio, label, hash, auth.DisplayPrefix(key))
+	return key, c, err
+}
+
+func (s *Service) StremioKeys(ctx context.Context, userID int64) ([]db.Credential, error) {
+	return s.repo.Credentials(ctx, userID, db.CredStremio)
+}
+
+func (s *Service) RevokeStremioKey(ctx context.Context, userID, id int64) error {
+	return s.repo.RevokeCredential(ctx, userID, id, db.CredStremio)
+}
+
+// StremioUser finds the user an add-on secret belongs to.
+func (s *Service) StremioUser(ctx context.Context, key string) (db.User, error) {
+	return s.repo.UserByCredential(ctx, db.CredStremio, auth.HashKey(key))
+}
+
+// FilesOf lists the files of items in a user's library, including ones that
+// are not cached now, so players keep seeing what an item holds.
+func (s *Service) FilesOf(ctx context.Context, userID int64, itemIDs []int64) ([]db.File, error) {
+	return s.repo.FilesOf(ctx, userID, itemIDs)
 }

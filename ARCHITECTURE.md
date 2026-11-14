@@ -13,7 +13,7 @@ One Go codebase, four programs, one Postgres database.
 
 | Program | Does |
 |---|---|
-| `api` | REST API and test web page: API keys, availability check, adding, libraries, links, owner tools. `api migrate`, `api create-user` |
+| `api` | REST API, test web page and the Stremio add-on (`/stremio/<secret>/…`): API keys, availability check, adding, libraries, links, owner tools. `api migrate`, `api create-user` |
 | `stream` | Serves cached files to holders of signed links, with byte ranges |
 | `ingest` | One loop per fetcher (`INGEST_FETCHERS`, today `qbittorrent`): claims queued items, drives the source, moves finished files into the cache |
 | `scheduler` | Evicts least recently used items, deletes blocked items' files, sweeps folders no item owns |
@@ -32,7 +32,7 @@ a timer, so a lost notification only delays work.
 | `item_sources` | How a request finds its item: unique `(kind, key)` (today `torrent` + info hash) and the payload (magnet) |
 | `item_files` | Files with stable IDs; `present`, `missing` or `pending` |
 | `user_items` | Each user's library |
-| `credentials` | Hashed API keys (more kinds arrive with their stages) |
+| `credentials` | Hashed secrets by kind: `api` keys and `stremio` add-on links (one per device) |
 | `user_limits` | Owner-set limits per user; `NULL` = server default |
 | `fetch_attempts` | One row per try by a fetcher |
 | `blocklist` | Takedowns by `(kind, key)` |
