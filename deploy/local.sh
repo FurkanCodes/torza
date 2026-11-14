@@ -27,7 +27,7 @@ set_env() {
 }
 
 dc() {
-	docker compose -f docker-compose.yml -f docker-compose.local.yml --env-file .env.local "$@"
+	docker compose -f docker-compose.yml -f docker-compose.build.yml --env-file .env.local "$@"
 }
 
 cmd=${1:-}

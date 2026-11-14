@@ -196,8 +196,18 @@ func (c *Client) login(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != "Ok." {
-		return ErrLogin
+	return loginResult(resp.StatusCode, string(body))
+}
+
+// loginResult reads a login answer. qBittorrent 4 answers 200 "Ok."; newer
+// versions answer 204 with no body. A wrong password is 200 "Fails." or 401.
+func loginResult(status int, body string) error {
+	b := strings.TrimSpace(body)
+	switch {
+	case status == http.StatusOK && b == "Ok.":
+		return nil
+	case status == http.StatusNoContent && b == "":
+		return nil
 	}
-	return nil
+	return ErrLogin
 }

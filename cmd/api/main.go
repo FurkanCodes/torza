@@ -3,6 +3,7 @@
 //	api                                   start the server
 //	api migrate                           run database migrations and exit
 //	api create-user -email you@x [-admin] create a user and print their API key
+//	api qbit-config -user admin -password … print a qBittorrent.conf for a new install
 package main
 
 import (
@@ -17,11 +18,20 @@ import (
 	"torza/internal/config"
 	"torza/internal/db"
 	"torza/internal/links"
+	"torza/internal/qbit"
 	"torza/internal/run"
 	"torza/internal/service"
 )
 
 func main() {
+	// Needs no database or settings: the installer runs it before anything starts.
+	if len(os.Args) > 1 && os.Args[1] == "qbit-config" {
+		if err := qbitConfig(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "qbit-config:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	log := run.Logger("api")
 	cfg, err := config.Load()
 	if err != nil {
@@ -85,5 +95,23 @@ func createUser(ctx context.Context, repo *db.Repo, args []string) error {
 		return err
 	}
 	fmt.Printf("Created user %d (%s, admin=%v)\nAPI key: %s\nSave it now. Torza only stores a hash, so it can't show the key again.\n", u.ID, u.Email, u.IsAdmin, key)
+	return nil
+}
+
+func qbitConfig(args []string) error {
+	fs := flag.NewFlagSet("qbit-config", flag.ContinueOnError)
+	user := fs.String("user", "admin", "qBittorrent Web UI user")
+	password := fs.String("password", "", "qBittorrent Web UI password")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if len(*password) < 12 {
+		return errors.New("-password must be at least 12 characters")
+	}
+	conf, err := qbit.Config(*user, *password)
+	if err != nil {
+		return err
+	}
+	fmt.Print(conf)
 	return nil
 }

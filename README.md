@@ -9,6 +9,19 @@ adds it; adding something cached is instant.
 database tests run against a real Postgres, but it hasn't been deployed to a
 server yet. Design: [docs/designs/torza.md](docs/designs/torza.md).
 
+## Install
+
+On any machine with Docker (a server, a home server or a Mac):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/FurkanCodes/torza/main/install/torza-setup.sh -o torza-setup.sh
+bash torza-setup.sh
+```
+
+It asks whether people reach Torza through your own domain (HTTPS), through
+Tailscale (private, no server needed) or from this machine only, and prints
+your admin API key. Details, settings and updates: [docs/INSTALL.md](docs/INSTALL.md).
+
 How it works: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Layout
@@ -147,27 +160,6 @@ every link is still signed; qBittorrent's Web UI stays on this Mac only. Run
 it again when the Mac's address changes, and `deploy/local.sh lan off` to
 close it. Links made before switching keep the old address: make new ones.
 
-## Deploying (first time)
-
-These steps haven't been run yet. Check each one on the first deploy.
-
-1. On the server, install Docker, clone this repo, then `cd deploy`.
-2. `cp .env.example .env` and fill it in.
-3. Create the data folder and give it to user 1000 (the user both Torza and
-   qBittorrent run as): `mkdir -p data && sudo chown 1000:1000 data`.
-4. Start qBittorrent alone first: `docker compose up -d qbittorrent`.
-5. **First start: set qBittorrent's password.** The image prints a temporary
-   password in its log: `docker compose logs qbittorrent`. From your own
-   computer, open a tunnel with `ssh -L 8090:127.0.0.1:8090 you@server`, then
-   go to http://localhost:8090 and log in as `admin`. In Tools → Options:
-   - Web UI: set a permanent password, and put the same one in `.env` as `QBIT_PASS`
-   - BitTorrent: turn off torrent queueing, or raise the limits, so torrents don't wait in qBittorrent's own queue
-6. Start everything: `docker compose up -d --build`.
-7. Create your admin user:
-   `docker compose run --rm api api create-user -email you@example.com -admin`.
-   Save the API key it prints.
-8. Test with a legal torrent, such as an Ubuntu release or a public-domain film.
-
 ## Takedowns
 
 When a rightsholder sends a notice, block the torrent:
@@ -180,3 +172,8 @@ curl -H "Authorization: Bearer $ADMIN_KEY" \
 
 It can't be added again, existing links stop working, and its files are
 deleted within one ingest check.
+
+## License
+
+[AGPL-3.0](LICENSE). You may run, change and share Torza. If you run a
+changed version for other people, you must offer them its source code.

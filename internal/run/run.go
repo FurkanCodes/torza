@@ -12,9 +12,12 @@ import (
 	"time"
 )
 
-// Logger returns a JSON logger tagged with the service name.
+// Version is set at build time (the release tag); "dev" otherwise.
+var Version = "dev"
+
+// Logger returns a JSON logger tagged with the service name and version.
 func Logger(service string) *slog.Logger {
-	return slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", service)
+	return slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", service, "version", Version)
 }
 
 // Context is cancelled on Ctrl-C or SIGTERM (what Docker sends to stop a container).

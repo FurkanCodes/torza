@@ -148,7 +148,7 @@ into the same core.
 
 *   The owner runs Torza locally on a Mac with Docker Desktop:
     `deploy/local.sh up|down|logs|ps|user|lan on|off` with
-    `deploy/docker-compose.local.yml`. Caddy is off locally; the API is on
+    `deploy/docker-compose.build.yml` (builds from source; the base compose file pulls the published image). Caddy is off locally; the API is on
     `:8080` and `stream` on `:8081`, reachable from the Mac only unless
     `lan on` opens them to the home Wi-Fi. `go build`, `go vet` and
     `go test` run on the Mac; database tests run locally against a
@@ -283,7 +283,7 @@ only delays work until the next check. On the server, Usenet ingest runs as
 a second `ingest` container (`-fetchers=usenet`) with its own CPU and memory
 limits, because PAR2 repair can use all CPU for hours.
 
-Locally, `deploy/docker-compose.local.yml` overrides the server compose
+Locally, `deploy/docker-compose.build.yml` (builds from source; the base compose file pulls the published image) overrides the server compose
 file: no Caddy, `api` on `:8080`, `stream` on `:8081`.
 
 ```text
@@ -1209,7 +1209,7 @@ Built as five commits, each passing CI on its own:
 *   **Proposed Changes**: Build the four programs into one image; tag passed
     in as the git commit.
 
-#### 39. `deploy/docker-compose.yml`, `docker-compose.local.yml`, `.env.example`, `Caddyfile`, `local.sh` (Modify)
+#### 39. `deploy/docker-compose.yml`, `docker-compose.build.yml`, `.env.example`, `Caddyfile`, `local.sh` (Modify)
 
 *   **Type / Scope**: Deployment, server and local.
 *   **Proposed Changes**: Remove `nats`. Add a one-shot `migrate` service
@@ -1319,6 +1319,28 @@ cache; it never searches. It lives in `api` under
     `UserByCredential(kind)`, `CreateCredential`, `Credentials`,
     `RevokeCredential`, `FilesOf`; `auth.NewStremioKey`; a "Watch in
     Stremio" section on the web page.
+
+### Self-hosting and release packaging (built 2026-11-14, between stages 4 and 5)
+
+Torza is published under AGPL-3.0 so anyone can run their own instance, and
+the same installer sets up the owner's public instance later.
+
+*   `.github/workflows/release.yml`: a `v*` tag publishes
+    `ghcr.io/furkancodes/torza:<version>` and `:latest` for amd64 and arm64
+    (Go cross-compiles natively; `run.Version` carries the tag).
+*   `deploy/docker-compose.yml` pulls the published image
+    (`TORZA_IMAGE`); `docker-compose.build.yml` builds from source (used by
+    `local.sh`). Caddy is the `caddy` profile; API and stream ports are on
+    127.0.0.1 unless `BIND_ADDR` opens them; ports and the qBittorrent config
+    location are settings.
+*   `install/torza-setup.sh`: domain (Caddy HTTPS), Tailscale (`tailscale
+    serve`) or local mode; writes `.env` with fresh secrets, writes
+    qBittorrent's config with its Web UI password hashed (`api qbit-config`,
+    PBKDF2-SHA512 as qBittorrent stores it) and queueing off, starts the
+    services and creates the admin. Running it again updates in place.
+*   `internal/qbit`: login accepts qBittorrent 5's `204` as well as
+    `200 "Ok."`.
+*   `docs/INSTALL.md`, `LICENSE`.
 
 ### Stage 5: HTTP downloader with Real-Debrid and TorBox
 

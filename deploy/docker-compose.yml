@@ -1,5 +1,8 @@
-# Torza on one server. Run from this folder: docker compose up -d --build
-# Settings come from .env next to this file (copy .env.example).
+# Torza on one machine. Settings come from .env next to this file (the
+# installer writes it; see docs/INSTALL.md). Run from this folder:
+#   docker compose up -d
+# COMPOSE_PROFILES=caddy in .env adds Caddy for HTTPS on your own domain.
+# Building from source instead of pulling: add -f docker-compose.build.yml.
 name: torza
 
 x-torza-env: &torza-env
@@ -20,9 +23,7 @@ x-torza-env: &torza-env
   INGEST_FETCHERS: ${INGEST_FETCHERS:-qbittorrent}
 
 x-torza: &torza
-  image: torza:local
-  build:
-    context: ..
+  image: ${TORZA_IMAGE:-ghcr.io/furkancodes/torza:latest}
   restart: unless-stopped
   environment: *torza-env
   depends_on: [postgres]
@@ -51,12 +52,16 @@ services:
       WEBUI_PORT: "8090"
       TORRENTING_PORT: "6881"
     ports:
-      - "6881:6881"
-      - "6881:6881/udp"
+      - "${TORRENT_PORT:-6881}:6881"
+      - "${TORRENT_PORT:-6881}:6881/udp"
       # Web UI, reachable only from the server itself (use an SSH tunnel).
-      - "127.0.0.1:8090:8090"
+      # (Open it as http://localhost:8090; another host port works for
+      # Torza but qBittorrent's Host-header check refuses browsers on it.)
+      - "127.0.0.1:${QBIT_UI_PORT:-8090}:8090"
     volumes:
-      - qbit_config:/config
+      # A named volume, or a folder (the installer uses ./qbittorrent so it
+      # can write the first config with the Web UI password).
+      - ${QBIT_CONFIG:-qbit_config}:/config
       # Must be the same path (/data) as in ingest: Torza tells qBittorrent
       # where to save each torrent.
       - ${DATA_PATH:-./data}:/data
@@ -64,10 +69,16 @@ services:
   api:
     <<: *torza
     command: ["api"]
+    ports:
+      # On this machine only, unless BIND_ADDR opens it (local.sh lan on).
+      # Caddy and Tailscale reach it here.
+      - "${BIND_ADDR:-127.0.0.1}:${API_PORT:-8080}:8080"
 
   stream:
     <<: *torza
     command: ["stream"]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${STREAM_PORT:-8081}:8081"
     volumes:
       - ${DATA_PATH:-./data}:/data:ro
 
@@ -86,6 +97,7 @@ services:
 
   caddy:
     image: caddy:2
+    profiles: ["caddy"]
     restart: unless-stopped
     ports:
       - "80:80"
