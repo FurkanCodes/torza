@@ -810,12 +810,10 @@ lives on the Mac's Docker Desktop disk.
 
 ### Additional Resources
 
-*   `concepts_brief.md` — brainstorm brief with both review rounds.
-*   `intermediate_zoom_out_report.md` — the review whose must-fix list this
-    revision applies.
-*   `ARCHITECTURE.md`, `README.md` — current (pre-rewrite) design.
-*   `~/reports/Debrid service competitive teardown.md` — earlier research
-    on how debrid services and their client tools work.
+*   `docs/design-review/concepts_brief.md` — brainstorm brief with both review rounds.
+*   `docs/design-review/intermediate_zoom_out_report.md` — the review whose
+    must-fix list this revision applies.
+*   `ARCHITECTURE.md`, `README.md` — how the built code works and is used.
 
 ### Future Improvements
 
