@@ -65,9 +65,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /stremio/{key}/meta/{type}/{id}", h.withUser(h.meta))
 	mux.HandleFunc("GET /stremio/{key}/stream/{type}/{id}", h.withUser(h.stream))
 	mux.HandleFunc("GET /stremio/{key}/play/{file}/{name}", h.withUser(h.play))
-	mux.HandleFunc("OPTIONS /stremio/", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("OPTIONS /stremio/", func(w http.ResponseWriter, r *http.Request) {
 		cors(w)
 		w.WriteHeader(http.StatusNoContent)
+		h.access(r, http.StatusNoContent)
 	})
 }
 
@@ -75,6 +76,9 @@ type userHandler func(w http.ResponseWriter, r *http.Request, u db.User)
 
 func (h *Handler) withUser(next userHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		w = sw
+		defer func() { h.access(r, sw.status) }()
 		cors(w)
 		u, err := h.svc.StremioUser(r.Context(), r.PathValue("key"))
 		if errors.Is(err, db.ErrNotFound) {
@@ -94,6 +98,9 @@ func cors(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+	// Chrome-based apps (Stremio 5 is one) ask before a web page may call
+	// 127.0.0.1 or a home-network address.
+	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 }
 
 // ── Manifest ────────────────────────────────────────────────────────────────
@@ -393,6 +400,31 @@ func (h *Handler) play(w http.ResponseWriter, r *http.Request, u db.User) {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+// access logs one add-on request without its secret, so problems with a
+// Stremio app can be seen in the api log.
+func (h *Handler) access(r *http.Request, status int) {
+	p := r.URL.Path
+	if k := r.PathValue("key"); k != "" {
+		p = strings.Replace(p, k, "<secret>", 1)
+	} else if parts := strings.SplitN(p, "/", 4); len(parts) == 4 {
+		p = "/stremio/<secret>/" + parts[3]
+	}
+	h.log.Info("stremio request", "method", r.Method, "path", p, "status", status,
+		"origin", r.Header.Get("Origin"), "agent", r.UserAgent())
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 // parseID reads "torza:<item>" or "torza:<item>:<file>", with or without the
 // ".json" Stremio adds.

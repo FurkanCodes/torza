@@ -524,16 +524,22 @@ $("stremio-form").addEventListener("submit", async (ev) => {
     $("stremio-install").href = r.install_url;
     $("stremio-copy-msg").textContent = "";
     $("stremio-result").hidden = false;
-    // Stremio installs plain-HTTP add-ons only from 127.0.0.1 on the same
-    // computer; any other address needs HTTPS.
+    $("stremio-url").value = addonURL;
+    // A stremio:// link always opens over HTTPS, so on plain HTTP the URL has
+    // to be pasted into Stremio. Stremio accepts plain-HTTP add-ons only
+    // from 127.0.0.1 on the computer running Torza.
     const local = location.hostname === "127.0.0.1" || location.hostname === "localhost";
-    if (location.protocol !== "https:" && !local) {
-      $("stremio-hint").textContent = "Stremio only installs add-ons over HTTPS, or from 127.0.0.1 on the computer running Torza. On that Mac, open http://127.0.0.1:" + (location.port || "80") + " and make the link there. Phones and TVs need Torza on HTTPS (the server deploy).";
-    } else if (location.protocol !== "https:") {
-      $("stremio-hint").textContent = "This link works in Stremio on this computer. Phones and TVs need Torza on HTTPS (the server deploy).";
+    const https = location.protocol === "https:";
+    $("stremio-install").hidden = !https;
+    if (https) {
+      $("stremio-hint").textContent = "\"Install in Stremio\" works on the device you're using now. For a TV or phone, paste the URL into Stremio's add-on search box.";
+    } else if (local) {
+      $("stremio-hint").textContent = "In Stremio, open Add-ons (the puzzle icon), paste this URL into the search box at the top, press Enter, then click Install. Your library is then in Discover → Torza library. This works on this computer only; phones and TVs need Torza on HTTPS (the server deploy).";
+    } else {
+      $("stremio-hint").textContent = "Stremio won't install this: it accepts plain-HTTP add-ons only from 127.0.0.1. On the Mac running Torza, open http://127.0.0.1:" + (location.port || "80") + " and make the link there. Phones and TVs need Torza on HTTPS (the server deploy).";
     }
     $("stremio-label").value = "";
-    $("stremio-install").focus();
+    ($("stremio-install").hidden ? $("stremio-copy") : $("stremio-install")).focus();
     loadAddons();
   } catch (e) {
     if (e.status !== 401) { $("stremio-error").textContent = "Couldn't make a link: " + e.message; $("stremio-error").hidden = false; }
