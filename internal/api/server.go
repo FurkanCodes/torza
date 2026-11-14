@@ -30,6 +30,7 @@ const MaxCheck = 100
 
 type Config struct {
 	PublicURL string // where the stream service is reached; the web page may play media from there
+	BaseURL   string // where this API is reached, for add-on links; empty = the address a request came to
 }
 
 type Server struct {
@@ -62,7 +63,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/stremio", s.withUser(s.listStremio))
 	mux.Handle("DELETE /v1/stremio/{id}", s.withUser(s.revokeStremio))
 	if s.svc != nil {
-		stremio.New(s.svc, s.log).Register(mux)
+		stremio.New(s.svc, s.cfg.BaseURL, s.log).Register(mux)
 	}
 	web := s.webHandler()
 	mux.Handle("GET /{$}", web)
@@ -440,7 +441,11 @@ func (s *Server) newStremio(w http.ResponseWriter, r *http.Request, u db.User) {
 		s.internalError(w, "new stremio key", err)
 		return
 	}
-	manifest := requestBase(r) + "/stremio/" + key + "/manifest.json"
+	base := s.cfg.BaseURL
+	if base == "" {
+		base = requestBase(r)
+	}
+	manifest := base + "/stremio/" + key + "/manifest.json"
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":           c.ID,
 		"label":        c.Label,

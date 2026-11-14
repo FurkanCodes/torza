@@ -6,6 +6,7 @@ x-torza-env: &torza-env
   DATABASE_URL: postgres://torza:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/torza?sslmode=disable
   DATA_DIR: /data
   PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
+  API_PUBLIC_URL: ${API_PUBLIC_URL:-}
   SIGNING_KEY: ${SIGNING_KEY:?set SIGNING_KEY in .env}
   QBIT_URL: http://qbittorrent:8090
   QBIT_USER: ${QBIT_USER:-admin}

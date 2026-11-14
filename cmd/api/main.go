@@ -60,7 +60,7 @@ func main() {
 		LinkTTL:   cfg.LinkTTL,
 		Defaults:  db.Limits{MaxActive: cfg.MaxActivePerUser, MaxItemBytes: cfg.MaxTorrentBytes},
 	})
-	srv := api.New(svc, api.Config{PublicURL: cfg.PublicURL}, log)
+	srv := api.New(svc, api.Config{PublicURL: cfg.PublicURL, BaseURL: cfg.APIURL}, log)
 	if err := run.ServeHTTP(ctx, log, cfg.APIAddr, srv.Handler()); err != nil {
 		run.Fatal(log, "http", err)
 	}

@@ -17,6 +17,7 @@ type Config struct {
 	DatabaseURL string
 	DataDir     string // holds incoming/ (downloading) and store/ (the cache)
 	PublicURL   string // base URL users reach the stream service at
+	APIURL      string // base URL users reach the API at; empty = whatever address a request came to
 	SigningKey  []byte // secret used to sign download links
 
 	APIAddr    string
@@ -46,6 +47,7 @@ func Load() (Config, error) {
 		DatabaseURL: p.str("DATABASE_URL", "postgres://torza:torza@postgres:5432/torza?sslmode=disable"),
 		DataDir:     p.str("DATA_DIR", "/data"),
 		PublicURL:   strings.TrimRight(p.str("PUBLIC_URL", "http://localhost:8081"), "/"),
+		APIURL:      strings.TrimRight(p.str("API_PUBLIC_URL", ""), "/"),
 		APIAddr:     p.str("API_ADDR", ":8080"),
 		StreamAddr:  p.str("STREAM_ADDR", ":8081"),
 		QbitURL:     p.str("QBIT_URL", "http://qbittorrent:8080"),

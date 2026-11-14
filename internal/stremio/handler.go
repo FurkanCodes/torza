@@ -52,11 +52,17 @@ type Service interface {
 var _ Service = (*service.Service)(nil)
 
 type Handler struct {
-	svc Service
-	log *slog.Logger
+	svc  Service
+	base string // where the API is reached; "" = the address each request came to
+	log  *slog.Logger
 }
 
-func New(svc Service, log *slog.Logger) *Handler { return &Handler{svc: svc, log: log} }
+// New makes the add-on. base is the API's public address (for example the
+// Tailscale HTTPS name); empty means play URLs use the address each request
+// came to.
+func New(svc Service, base string, log *slog.Logger) *Handler {
+	return &Handler{svc: svc, base: strings.TrimRight(base, "/"), log: log}
+}
 
 // Register mounts the add-on's routes on mux.
 func (h *Handler) Register(mux *http.ServeMux) {
@@ -322,7 +328,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, u db.User) {
 	}
 	streams := []map[string]any{}
 	if found {
-		base := baseURL(r) + "/stremio/" + url.PathEscape(r.PathValue("key")) + "/play/"
+		base := h.baseURL(r) + "/stremio/" + url.PathEscape(r.PathValue("key")) + "/play/"
 		for _, f := range e.videos {
 			if fileID != 0 && f.ID != fileID {
 				continue
@@ -451,7 +457,10 @@ func parseID(s string) (itemID, fileID int64, ok bool) {
 // baseURL is where this request reached the API, so play URLs work from
 // wherever Stremio installed the add-on (localhost, the home network, or
 // HTTPS behind Caddy).
-func baseURL(r *http.Request) string {
+func (h *Handler) baseURL(r *http.Request) string {
+	if h.base != "" {
+		return h.base
+	}
 	scheme := "http"
 	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
 		scheme = "https"

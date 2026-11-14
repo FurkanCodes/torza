@@ -250,3 +250,23 @@ func TestRevoke(t *testing.T) {
 		t.Fatalf("revoked add-on still works: %d", code)
 	}
 }
+
+// With a public API address set (Tailscale, a domain), add-on and play links
+// use it, whatever address the request came to.
+func TestConfiguredBaseURL(t *testing.T) {
+	e := newEnv(t)
+	svcHandler := api.New(e.svc, api.Config{PublicURL: "http://dl.test", BaseURL: "https://torza.example.ts.net"},
+		slog.New(slog.NewTextHandler(io.Discard, nil))).Handler()
+	e.h = svcHandler
+	rec := e.do(t, "POST", "/v1/stremio", apiKey, "")
+	var created map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &created)
+	if !strings.HasPrefix(created["manifest_url"].(string), "https://torza.example.ts.net/stremio/tzs_") {
+		t.Fatalf("manifest url: %v", created)
+	}
+	id := e.item(t, 1, "Big Buck Bunny", "bbb.mp4")
+	_, st := e.get(t, fmt.Sprintf("/stream/movie/torza:%d.json", id))
+	if u := st["streams"].([]any)[0].(map[string]any)["url"].(string); !strings.HasPrefix(u, "https://torza.example.ts.net/stremio/") {
+		t.Fatalf("play url: %s", u)
+	}
+}

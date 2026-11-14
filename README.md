@@ -97,7 +97,25 @@ Make a link on the web page ("Watch in Stremio") or with `POST /v1/stremio`,
 then open the `stremio://` link or paste the manifest URL into Stremio's
 add-on search. Stremio installs plain-HTTP add-ons only from `127.0.0.1` on
 the same computer, so locally open the page at http://127.0.0.1:8080 to make
-the link; phones and TVs need Torza on HTTPS (the server deploy).
+the link. Phones and TVs need HTTPS: use Tailscale (below) or a server.
+
+### Phones and TVs through Tailscale (no server needed)
+
+Tailscale gives the Mac a private HTTPS address that only your own devices
+can reach, with a real certificate Stremio accepts.
+
+1. Install Tailscale on the Mac and on the phone or TV, signed in to the same
+   account.
+2. In https://login.tailscale.com/admin/dns turn on MagicDNS and HTTPS
+   Certificates.
+3. `deploy/local.sh tailscale on`. It prints the address
+   (`https://<mac>.<tailnet>.ts.net`), points download links there, and keeps
+   the Mac awake while it serves (closing the lid still sleeps it).
+4. On the phone or TV, open that address, make a Stremio link, and paste it
+   into Stremio's add-on search.
+
+`deploy/local.sh tailscale off` stops it. Running `lan on|off` afterwards
+switches links back to the local addresses.
 
 ## Running locally (Mac)
 
